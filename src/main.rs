@@ -39,14 +39,18 @@ enum State {
     Walk,
     Idle,
     Sleep,
+    Alert,
+    Jump,
 }
 
 impl State {
     fn frame_count(self) -> usize {
         match self {
-            State::Walk => 8,
-            State::Idle => 4,
+            State::Walk  => 8,
+            State::Idle  => 4,
             State::Sleep => 4,
+            State::Alert => 4,
+            State::Jump  => 4,
         }
     }
 
@@ -55,6 +59,7 @@ impl State {
             State::Walk  => 8_000 + (time % 6_000),
             State::Idle  => 3_000 + (time % 4_000),
             State::Sleep => 8_000 + (time % 8_000),
+            State::Alert | State::Jump => u32::MAX,
         }
     }
 
@@ -63,6 +68,7 @@ impl State {
             State::Walk  => State::Idle,
             State::Idle  => if (time / 1_000) % 3 == 0 { State::Sleep } else { State::Walk },
             State::Sleep => State::Idle,
+            State::Alert | State::Jump => State::Idle,
         }
     }
 }
@@ -126,6 +132,8 @@ struct PetApp {
     walk: Frames,
     idle: Frames,
     sleep: Frames,
+    alert: Frames,
+    jump: Frames,
     state: State,
     state_start_ms: u32,
     frame_idx: usize,
@@ -155,6 +163,8 @@ impl PetApp {
             State::Walk  => &self.walk,
             State::Idle  => &self.idle,
             State::Sleep => &self.sleep,
+            State::Alert => &self.alert,
+            State::Jump  => &self.jump,
         };
         let frame_data: &[u8] = if self.vel_x >= 0 {
             &frames.right[self.frame_idx]
@@ -237,11 +247,18 @@ impl CompositorHandler for PetApp {
         }
 
         if time.wrapping_sub(self.last_anim_ms) >= ANIM_MS {
-            self.frame_idx = (self.frame_idx + 1) % self.state.frame_count();
+            let next = (self.frame_idx + 1) % self.state.frame_count();
+            if next == 0 && self.state == State::Jump {
+                self.state = State::Idle;
+                self.state_start_ms = time;
+                self.frame_idx = 0;
+            } else {
+                self.frame_idx = next;
+            }
             self.last_anim_ms = time;
         }
 
-        if !self.dragging {
+        if !self.dragging && !matches!(self.state, State::Alert | State::Jump) {
             if time.wrapping_sub(self.state_start_ms) >= self.state.duration_ms(time) {
                 self.state = self.state.next(time);
                 self.state_start_ms = time;
@@ -327,6 +344,17 @@ impl PointerHandler for PetApp {
     ) {
         for event in events {
             match event.kind {
+                PointerEventKind::Enter { .. } if !self.dragging => {
+                    self.state = State::Alert;
+                    self.frame_idx = 0;
+                }
+                PointerEventKind::Leave { .. } if !self.dragging => {
+                    if self.state == State::Alert {
+                        self.state = State::Idle;
+                        self.state_start_ms = self.last_anim_ms;
+                        self.frame_idx = 0;
+                    }
+                }
                 PointerEventKind::Press { button, .. } if button == BTN_LEFT => {
                     self.dragging = true;
                     self.drag_start_pos_x = self.pos_x;
@@ -346,7 +374,7 @@ impl PointerHandler for PetApp {
                 }
                 PointerEventKind::Release { button, .. } if button == BTN_LEFT => {
                     self.dragging = false;
-                    self.state = State::Idle;
+                    self.state = State::Jump;
                     self.state_start_ms = self.last_anim_ms;
                     self.frame_idx = 0;
                 }
@@ -436,6 +464,8 @@ fn main() {
     let walk  = load_anim(&sheet, 4, 8);
     let idle  = load_anim(&sheet, 0, 4);
     let sleep = load_anim(&sheet, 6, 4);
+    let alert = load_anim(&sheet, 7, 4);
+    let jump  = load_anim(&sheet, 8, 4);
 
     let conn = Connection::connect_to_env()
         .expect("Could not connect to Wayland display. Is $WAYLAND_DISPLAY set?");
@@ -458,6 +488,8 @@ fn main() {
         walk,
         idle,
         sleep,
+        alert,
+        jump,
         state: State::Walk,
         state_start_ms: 0,
         frame_idx: 0,
