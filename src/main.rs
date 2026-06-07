@@ -26,7 +26,7 @@ const SCALE: u32 = 3;
 const DISP_W: u32 = FRAME_W * SCALE;
 const DISP_H: u32 = FRAME_H * SCALE;
 const WALK_PX: i32 = 2;
-const SCREEN_W: i32 = 1920;
+const SCREEN_W_FALLBACK: i32 = 1920;
 const ANIM_MS: u32 = 120;
 
 #[derive(Clone, Copy, PartialEq)]
@@ -130,6 +130,24 @@ struct PetApp {
 }
 
 impl PetApp {
+    fn screen_width(&self) -> i32 {
+        self.output_state
+            .outputs()
+            .next()
+            .and_then(|o| self.output_state.info(&o))
+            .map(|info| {
+                if let Some((w, _)) = info.logical_size {
+                    return w;
+                }
+                info.modes
+                    .iter()
+                    .find(|m| m.current)
+                    .map(|m| m.dimensions.0 / info.scale_factor.max(1))
+                    .unwrap_or(SCREEN_W_FALLBACK)
+            })
+            .unwrap_or(SCREEN_W_FALLBACK)
+    }
+
     fn draw(&mut self, qh: &QueueHandle<Self>) {
         let width = self.width;
         let height = self.height;
@@ -216,7 +234,7 @@ impl CompositorHandler for PetApp {
 
         if self.state == State::Walk {
             self.pos_x += self.vel_x;
-            let max_x = SCREEN_W - self.width as i32;
+            let max_x = self.screen_width() - self.width as i32;
             if self.pos_x <= 0 {
                 self.pos_x = 0;
                 self.vel_x = WALK_PX;
