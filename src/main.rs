@@ -181,7 +181,11 @@ fn main() {
     let sprite: Vec<u8> = img
         .into_raw()
         .chunks_exact(4)
-        .flat_map(|p| [p[2], p[1], p[0], p[3]])
+        .flat_map(|p| {
+            let a = p[3];
+            let premul = |c: u8| (c as u16 * a as u16 / 255) as u8;
+            [premul(p[2]), premul(p[1]), premul(p[0]), a]
+        })
         .collect();
 
     let conn = Connection::connect_to_env()
