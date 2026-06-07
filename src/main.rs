@@ -5,7 +5,7 @@ use wayland_client::{
 };
 
 use smithay_client_toolkit::{
-    compositor::{CompositorHandler, CompositorState},
+    compositor::{CompositorHandler, CompositorState, Region},
     delegate_compositor, delegate_layer, delegate_output, delegate_registry, delegate_shm,
     output::{OutputHandler, OutputState},
     registry::{ProvidesRegistryState, RegistryState},
@@ -382,6 +382,8 @@ fn main() {
     layer_surface.set_margin(0, 0, 16, 0);
     layer_surface.set_exclusive_zone(-1);
     layer_surface.set_keyboard_interactivity(KeyboardInteractivity::None);
+    let empty_region = Region::new(&app.compositor_state).expect("wl_region");
+    layer_surface.wl_surface().set_input_region(Some(empty_region.wl_region()));
     layer_surface.wl_surface().commit();
     app.layer_surface = Some(layer_surface);
 
