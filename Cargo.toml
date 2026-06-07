@@ -1,0 +1,11 @@
+[package]
+name = "pet-linux"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# Ergonomic Wayland client toolkit — handles protocol boilerplate,
+# layer-shell, shared memory buffers, output tracking, etc.
+smithay-client-toolkit = "0.19"
+# The underlying Wayland bindings that SCTK builds on
+wayland-client = "0.31"
