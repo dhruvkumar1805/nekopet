@@ -31,6 +31,7 @@ struct PetApp {
     width: u32,
     height: u32,
     running: bool,
+    sprite: Vec<u8>,
 }
 
 impl PetApp {
@@ -53,22 +54,7 @@ impl PetApp {
                 )
                 .expect("create_buffer failed");
 
-            let cx = width / 2;
-            let cy = height / 2;
-            let radius = (width.min(height) / 2).saturating_sub(8);
-
-            for (i, pixel) in canvas.chunks_exact_mut(4).enumerate() {
-                let x = (i as u32) % width;
-                let y = (i as u32) / width;
-                let dx = x as i32 - cx as i32;
-                let dy = y as i32 - cy as i32;
-
-                if dx * dx + dy * dy < (radius * radius) as i32 {
-                    pixel.copy_from_slice(&[0, 165, 255, 220]);
-                } else {
-                    pixel.copy_from_slice(&[0, 0, 0, 0]);
-                }
-            }
+            canvas.copy_from_slice(&self.sprite);
 
             buffer
         };
@@ -186,6 +172,18 @@ delegate_layer!(PetApp);
 delegate_registry!(PetApp);
 
 fn main() {
+    let img = image::open("assets/cat.png")
+        .expect("Failed to open assets/cat.png")
+        .resize_exact(128, 128, image::imageops::FilterType::Nearest)
+        .into_rgba8();
+    let sprite_width = img.width();
+    let sprite_height = img.height();
+    let sprite: Vec<u8> = img
+        .into_raw()
+        .chunks_exact(4)
+        .flat_map(|p| [p[2], p[1], p[0], p[3]])
+        .collect();
+
     let conn = Connection::connect_to_env()
         .expect("Could not connect to Wayland display. Is $WAYLAND_DISPLAY set?");
 
@@ -202,9 +200,10 @@ fn main() {
             .expect("zwlr_layer_shell_v1 not available — is the compositor wlroots-based?"),
         layer_surface: None,
         pool: None,
-        width: 128,
-        height: 128,
+        width: sprite_width,
+        height: sprite_height,
         running: true,
+        sprite,
     };
 
     let surface = app.compositor_state.create_surface(&qh);
