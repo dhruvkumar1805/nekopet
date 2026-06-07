@@ -20,6 +20,30 @@ use smithay_client_toolkit::{
     shm::{slot::SlotPool, Shm, ShmHandler},
 };
 
+const FRAME_W: u32 = 32;
+const FRAME_H: u32 = 32;
+const SCALE: u32 = 3;
+const DISP_W: u32 = FRAME_W * SCALE;
+const DISP_H: u32 = FRAME_H * SCALE;
+const WALK_ROW: u32 = 4;
+const FRAME_COUNT: usize = 8;
+const ANIM_MS: u32 = 120;
+const WALK_PX: i32 = 2;
+const SCREEN_W: i32 = 1920;
+
+fn flip_h(frame: &[u8], w: u32, h: u32) -> Vec<u8> {
+    let (w, h) = (w as usize, h as usize);
+    let mut out = vec![0u8; frame.len()];
+    for y in 0..h {
+        for x in 0..w {
+            let src = (y * w + (w - 1 - x)) * 4;
+            let dst = (y * w + x) * 4;
+            out[dst..dst + 4].copy_from_slice(&frame[src..src + 4]);
+        }
+    }
+    out
+}
+
 struct PetApp {
     registry_state: RegistryState,
     compositor_state: CompositorState,
@@ -31,20 +55,30 @@ struct PetApp {
     width: u32,
     height: u32,
     running: bool,
-    sprite: Vec<u8>,
+    frames: Vec<Vec<u8>>,
+    frames_flip: Vec<Vec<u8>>,
+    frame_idx: usize,
+    last_anim_ms: u32,
+    pos_x: i32,
+    vel_x: i32,
 }
 
 impl PetApp {
-    fn draw(&mut self, _qh: &QueueHandle<Self>) {
+    fn draw(&mut self, qh: &QueueHandle<Self>) {
         let width = self.width;
         let height = self.height;
+
+        let frame_data: &[u8] = if self.vel_x >= 0 {
+            &self.frames[self.frame_idx]
+        } else {
+            &self.frames_flip[self.frame_idx]
+        };
 
         let buffer = {
             let pool = match self.pool.as_mut() {
                 Some(p) => p,
                 None => return,
             };
-
             let (buffer, canvas) = pool
                 .create_buffer(
                     width as i32,
@@ -53,13 +87,14 @@ impl PetApp {
                     wl_shm::Format::Argb8888,
                 )
                 .expect("create_buffer failed");
-
-            canvas.copy_from_slice(&self.sprite);
-
+            canvas.copy_from_slice(frame_data);
             buffer
         };
 
-        let surface = self.layer_surface.as_ref().unwrap().wl_surface();
+        let layer = self.layer_surface.as_ref().unwrap();
+        layer.set_margin(0, 0, 16, self.pos_x);
+        let surface = layer.wl_surface();
+        surface.frame(qh, surface.clone());
         surface.damage_buffer(0, 0, width as i32, height as i32);
         buffer.attach_to(surface).expect("attach_to failed");
         surface.commit();
@@ -69,46 +104,64 @@ impl PetApp {
 impl CompositorHandler for PetApp {
     fn scale_factor_changed(
         &mut self,
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-        _surface: &wl_surface::WlSurface,
-        _new_factor: i32,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_surface::WlSurface,
+        _: i32,
     ) {
     }
 
     fn transform_changed(
         &mut self,
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-        _surface: &wl_surface::WlSurface,
-        _new_transform: wl_output::Transform,
-    ) {}
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_surface::WlSurface,
+        _: wl_output::Transform,
+    ) {
+    }
 
     fn frame(
         &mut self,
-        _conn: &Connection,
+        _: &Connection,
         qh: &QueueHandle<Self>,
-        _surface: &wl_surface::WlSurface,
-        _time: u32,
+        _: &wl_surface::WlSurface,
+        time: u32,
     ) {
+        if time.wrapping_sub(self.last_anim_ms) >= ANIM_MS {
+            self.frame_idx = (self.frame_idx + 1) % FRAME_COUNT;
+            self.last_anim_ms = time;
+        }
+
+        self.pos_x += self.vel_x;
+        let max_x = SCREEN_W - self.width as i32;
+        if self.pos_x <= 0 {
+            self.pos_x = 0;
+            self.vel_x = WALK_PX;
+        } else if self.pos_x >= max_x {
+            self.pos_x = max_x;
+            self.vel_x = -WALK_PX;
+        }
+
         self.draw(qh);
     }
 
     fn surface_enter(
         &mut self,
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-        _surface: &wl_surface::WlSurface,
-        _output: &wl_output::WlOutput,
-    ) {}
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_surface::WlSurface,
+        _: &wl_output::WlOutput,
+    ) {
+    }
 
     fn surface_leave(
         &mut self,
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-        _surface: &wl_surface::WlSurface,
-        _output: &wl_output::WlOutput,
-    ) {}
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_surface::WlSurface,
+        _: &wl_output::WlOutput,
+    ) {
+    }
 }
 
 impl OutputHandler for PetApp {
@@ -117,7 +170,12 @@ impl OutputHandler for PetApp {
     }
     fn new_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
     fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
-    fn output_destroyed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {
+    fn output_destroyed(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: wl_output::WlOutput,
+    ) {
     }
 }
 
@@ -134,11 +192,11 @@ impl LayerShellHandler for PetApp {
 
     fn configure(
         &mut self,
-        _conn: &Connection,
+        _: &Connection,
         qh: &QueueHandle<Self>,
-        _layer: &LayerSurface,
+        _: &LayerSurface,
         configure: LayerSurfaceConfigure,
-        _serial: u32,
+        _: u32,
     ) {
         if configure.new_size.0 != 0 {
             self.width = configure.new_size.0;
@@ -172,25 +230,33 @@ delegate_layer!(PetApp);
 delegate_registry!(PetApp);
 
 fn main() {
-    let img = image::open("assets/cat.png")
-        .expect("Failed to open assets/cat.png")
-        .resize_exact(128, 128, image::imageops::FilterType::Nearest)
+    let img = image::open("assets/sheet.png")
+        .expect("Failed to open assets/sheet.png")
         .into_rgba8();
-    let sprite_width = img.width();
-    let sprite_height = img.height();
-    let sprite: Vec<u8> = img
-        .into_raw()
-        .chunks_exact(4)
-        .flat_map(|p| {
-            let a = p[3];
-            let premul = |c: u8| (c as u16 * a as u16 / 255) as u8;
-            [premul(p[2]), premul(p[1]), premul(p[0]), a]
+
+    let frames: Vec<Vec<u8>> = (0..FRAME_COUNT as u32)
+        .map(|col| {
+            let frame_buf = image::ImageBuffer::from_fn(FRAME_W, FRAME_H, |px, py| {
+                *img.get_pixel(col * FRAME_W + px, WALK_ROW * FRAME_H + py)
+            });
+            image::DynamicImage::from(frame_buf)
+                .resize_exact(DISP_W, DISP_H, image::imageops::FilterType::Nearest)
+                .into_rgba8()
+                .into_raw()
+                .chunks_exact(4)
+                .flat_map(|p| {
+                    let a = p[3];
+                    let premul = |c: u8| (c as u16 * a as u16 / 255) as u8;
+                    [premul(p[2]), premul(p[1]), premul(p[0]), a]
+                })
+                .collect()
         })
         .collect();
 
+    let frames_flip: Vec<Vec<u8>> = frames.iter().map(|f| flip_h(f, DISP_W, DISP_H)).collect();
+
     let conn = Connection::connect_to_env()
         .expect("Could not connect to Wayland display. Is $WAYLAND_DISPLAY set?");
-
     let (globals, mut event_queue) = registry_queue_init(&conn).unwrap();
     let qh = event_queue.handle();
 
@@ -201,17 +267,21 @@ fn main() {
         output_state: OutputState::new(&globals, &qh),
         shm: Shm::bind(&globals, &qh).expect("wl_shm not available"),
         layer_shell: LayerShell::bind(&globals, &qh)
-            .expect("zwlr_layer_shell_v1 not available — is the compositor wlroots-based?"),
+            .expect("zwlr_layer_shell_v1 not available"),
         layer_surface: None,
         pool: None,
-        width: sprite_width,
-        height: sprite_height,
+        width: DISP_W,
+        height: DISP_H,
         running: true,
-        sprite,
+        frames,
+        frames_flip,
+        frame_idx: 0,
+        last_anim_ms: 0,
+        pos_x: 0,
+        vel_x: WALK_PX,
     };
 
     let surface = app.compositor_state.create_surface(&qh);
-
     let layer_surface = app.layer_shell.create_layer_surface(
         &qh,
         surface,
@@ -219,14 +289,12 @@ fn main() {
         Some("pet-cat"),
         None,
     );
-
-    layer_surface.set_size(app.width, app.height);
-    layer_surface.set_anchor(Anchor::BOTTOM | Anchor::RIGHT);
-    layer_surface.set_margin(0, 16, 16, 0);
+    layer_surface.set_size(DISP_W, DISP_H);
+    layer_surface.set_anchor(Anchor::BOTTOM | Anchor::LEFT);
+    layer_surface.set_margin(0, 0, 16, 0);
     layer_surface.set_exclusive_zone(-1);
     layer_surface.set_keyboard_interactivity(KeyboardInteractivity::None);
     layer_surface.wl_surface().commit();
-
     app.layer_surface = Some(layer_surface);
 
     while app.running {
