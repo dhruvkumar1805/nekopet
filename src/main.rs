@@ -33,6 +33,8 @@ const DISP_H: u32 = FRAME_H * SCALE;
 const WALK_PX: i32 = 2;
 const ANIM_MS: u32 = 120;
 const CAT_BOTTOM_MARGIN: i32 = 16;
+const BODY_L: i32 = 21;
+const BODY_R: i32 = 21;
 
 #[derive(Clone, Copy, PartialEq)]
 enum State {
@@ -60,6 +62,14 @@ impl State {
             State::Idle  => 3_000 + (time % 4_000),
             State::Sleep => 8_000 + (time % 8_000),
             State::Alert | State::Jump => u32::MAX,
+        }
+    }
+
+    fn body_top(self) -> i32 {
+        match self {
+            State::Sleep => 72,
+            State::Jump  => 42,
+            _            => 60,
         }
     }
 
@@ -172,8 +182,16 @@ impl PetApp {
             &frames.left[self.frame_idx]
         };
 
-        let cat_x = self.pos_x.clamp(0, width as i32 - DISP_W as i32) as usize;
-        let cat_y = self.pos_y.clamp(0, height as i32 - DISP_H as i32) as usize;
+        let src_x_off = (-self.pos_x).max(0) as usize;
+        let src_y_off = (-self.pos_y).max(0) as usize;
+        let dst_x = self.pos_x.max(0) as usize;
+        let dst_y = self.pos_y.max(0) as usize;
+        let copy_w = ((DISP_W as i32 - src_x_off as i32)
+            .min(width as i32 - dst_x as i32))
+            .max(0) as usize;
+        let copy_h = ((DISP_H as i32 - src_y_off as i32)
+            .min(height as i32 - dst_y as i32))
+            .max(0) as usize;
 
         let buffer = {
             let pool = match self.pool.as_mut() {
@@ -189,11 +207,12 @@ impl PetApp {
                 )
                 .expect("create_buffer failed");
             canvas.fill(0);
-            for row in 0..DISP_H as usize {
-                let src = row * DISP_W as usize * 4;
-                let dst = (cat_y + row) * width as usize * 4 + cat_x * 4;
-                canvas[dst..dst + DISP_W as usize * 4]
-                    .copy_from_slice(&frame_data[src..src + DISP_W as usize * 4]);
+            for row in 0..copy_h {
+                if copy_w == 0 { break; }
+                let src = (row + src_y_off) * DISP_W as usize * 4 + src_x_off * 4;
+                let dst = (dst_y + row) * width as usize * 4 + dst_x * 4;
+                canvas[dst..dst + copy_w * 4]
+                    .copy_from_slice(&frame_data[src..src + copy_w * 4]);
             }
             buffer
         };
@@ -202,7 +221,14 @@ impl PetApp {
         if self.dragging {
             region.wl_region().add(0, 0, width as i32, height as i32);
         } else {
-            region.wl_region().add(cat_x as i32, cat_y as i32, DISP_W as i32, DISP_H as i32);
+            let body_t = self.state.body_top();
+            let ir_x = (self.pos_x + BODY_L).max(0);
+            let ir_y = (self.pos_y + body_t).max(0);
+            let ir_w = (DISP_W as i32 - BODY_L - BODY_R)
+                .min(width as i32 - ir_x)
+                .max(0);
+            let ir_h = ((self.pos_y + DISP_H as i32).min(height as i32) - ir_y).max(0);
+            region.wl_region().add(ir_x, ir_y, ir_w, ir_h);
         }
 
         let layer = self.layer_surface.as_ref().unwrap();
@@ -267,9 +293,9 @@ impl CompositorHandler for PetApp {
 
             if self.state == State::Walk {
                 self.pos_x += self.vel_x;
-                let max_x = (self.width as i32 - DISP_W as i32).max(0);
-                if self.pos_x <= 0 {
-                    self.pos_x = 0;
+                let max_x = (self.width as i32 - DISP_W as i32 + BODY_R).max(0);
+                if self.pos_x <= -BODY_L {
+                    self.pos_x = -BODY_L;
                     self.vel_x = WALK_PX;
                 } else if self.pos_x >= max_x {
                     self.pos_x = max_x;
@@ -363,14 +389,15 @@ impl PointerHandler for PetApp {
                     self.drag_start_local_y = event.position.1;
                 }
                 PointerEventKind::Motion { .. } if self.dragging => {
-                    let max_x = (self.width as i32 - DISP_W as i32).max(0);
+                    let max_x = (self.width as i32 - DISP_W as i32 + BODY_R).max(0);
                     let max_y = (self.height as i32 - DISP_H as i32).max(0);
+                    let min_y = -self.state.body_top();
                     self.pos_x = (self.drag_start_pos_x
                         + (event.position.0 - self.drag_start_local_x) as i32)
-                        .clamp(0, max_x);
+                        .clamp(-BODY_L, max_x);
                     self.pos_y = (self.drag_start_pos_y
                         + (event.position.1 - self.drag_start_local_y) as i32)
-                        .clamp(0, max_y);
+                        .clamp(min_y, max_y);
                 }
                 PointerEventKind::Release { button, .. } if button == BTN_LEFT => {
                     self.dragging = false;
