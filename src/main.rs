@@ -27,18 +27,44 @@ use smithay_client_toolkit::{
     shm::{slot::SlotPool, Shm, ShmHandler},
 };
 
+#[derive(serde::Deserialize)]
+#[serde(default)]
+struct Config {
+    scale:       u32,
+    speed:       i32,
+    anim_ms:     u32,
+    sound:       bool,
+    volume:      f32,
+    chase_start: f64,
+    chase_stop:  f64,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self { scale: 3, speed: 2, anim_ms: 120, sound: true, volume: 1.0, chase_start: 120.0, chase_stop: 48.0 }
+    }
+}
+
+fn load_config() -> Config {
+    let config_home = std::env::var("XDG_CONFIG_HOME").unwrap_or_else(|_| {
+        format!("{}/.config", std::env::var("HOME").unwrap_or_else(|_| ".".into()))
+    });
+    let path = std::path::PathBuf::from(&config_home).join("pet-linux/config.toml");
+    if !path.exists() {
+        let _ = std::fs::create_dir_all(path.parent().unwrap());
+        let _ = std::fs::write(&path,
+            "scale       = 3\nspeed       = 2\nanim_ms     = 120\nsound       = true\nvolume      = 1.0\nchase_start = 120.0\nchase_stop  = 48.0\n");
+    }
+    std::fs::read_to_string(&path).ok()
+        .and_then(|s| toml::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
 const FRAME_W: u32 = 32;
 const FRAME_H: u32 = 32;
-const SCALE: u32 = 3;
-const DISP_W: u32 = FRAME_W * SCALE;
-const DISP_H: u32 = FRAME_H * SCALE;
-const WALK_PX: i32 = 2;
-const ANIM_MS: u32 = 120;
+const BODY_L_SRC: i32 = 7;
+const BODY_R_SRC: i32 = 7;
 const CAT_BOTTOM_MARGIN: i32 = 16;
-const CHASE_STOP_PX: f64 = 48.0;
-const CHASE_START_PX: f64 = 120.0;
-const BODY_L: i32 = 21;
-const BODY_R: i32 = 21;
 
 #[derive(Clone, Copy, PartialEq)]
 enum State {
@@ -71,11 +97,11 @@ impl State {
         }
     }
 
-    fn body_top(self) -> i32 {
+    fn body_top_src(self) -> i32 {
         match self {
-            State::Sleep | State::Pet => 72,
-            State::Jump               => 42,
-            _                         => 60,
+            State::Sleep | State::Pet => 24,
+            State::Jump               => 14,
+            _                         => 20,
         }
     }
 
@@ -89,10 +115,10 @@ impl State {
     }
 }
 
-fn play(handle: &OutputStreamHandle, path: &str) {
+fn play(handle: &OutputStreamHandle, path: &str, volume: f32) {
     if let Ok(file) = std::fs::File::open(path) {
         if let Ok(source) = Decoder::new(std::io::BufReader::new(file)) {
-            let _ = handle.play_raw(source.convert_samples());
+            let _ = handle.play_raw(source.amplify(volume).convert_samples());
         }
     }
 }
@@ -106,6 +132,8 @@ fn load_anim(
     sheet: &image::ImageBuffer<image::Rgba<u8>, Vec<u8>>,
     row: u32,
     count: u32,
+    disp_w: u32,
+    disp_h: u32,
 ) -> Frames {
     let right: Vec<Vec<u8>> = (0..count)
         .map(|col| {
@@ -113,7 +141,7 @@ fn load_anim(
                 *sheet.get_pixel(col * FRAME_W + px, row * FRAME_H + py)
             });
             image::DynamicImage::from(buf)
-                .resize_exact(DISP_W, DISP_H, image::imageops::FilterType::Nearest)
+                .resize_exact(disp_w, disp_h, image::imageops::FilterType::Nearest)
                 .into_rgba8()
                 .into_raw()
                 .chunks_exact(4)
@@ -125,7 +153,7 @@ fn load_anim(
                 .collect()
         })
         .collect();
-    let left = right.iter().map(|f| flip_h(f, DISP_W, DISP_H)).collect();
+    let left = right.iter().map(|f| flip_h(f, disp_w, disp_h)).collect();
     Frames { right, left }
 }
 
@@ -167,10 +195,12 @@ fn shift_pupils(
     cursor_y: f64,
     facing_right: bool,
     state: State,
+    scale: u32,
+    disp_w: u32,
 ) {
-    let s = SCALE as i32;
-    let face_cx = pos_x as f64 + DISP_W as f64 * 0.5;
-    let face_cy = pos_y as f64 + 22.0 * SCALE as f64;
+    let s = scale as i32;
+    let face_cx = pos_x as f64 + disp_w as f64 * 0.5;
+    let face_cy = pos_y as f64 + 22.0 * scale as f64;
     let ddx = cursor_x - face_cx;
     let ddy = cursor_y - face_cy;
     let dist = (ddx * ddx + ddy * ddy).sqrt();
@@ -186,7 +216,12 @@ fn shift_pupils(
 
     match state {
         State::Idle => {
-            let eyes: &[i32] = if facing_right { &[48, 57] } else { &[36, 45] };
+            let (el, er) = (16 * s, 19 * s);
+            let eyes: &[i32] = if facing_right {
+                &[el, er]
+            } else {
+                &[disp_w as i32 - er - s, disp_w as i32 - el - s]
+            };
             let ey = 23 * s;
             for &ex in eyes {
                 paint_block(canvas, cw, pos_x + ex, pos_y + ey, s, GRAY);
@@ -194,7 +229,7 @@ fn shift_pupils(
             }
         }
         State::Alert => {
-            let ex = if facing_right { 19 * s } else { DISP_W as i32 - 19 * s - s };
+            let ex = if facing_right { 19 * s } else { disp_w as i32 - 19 * s - s };
             let ey = 25 * s;
             paint_block(canvas, cw, pos_x + ex, pos_y + ey, s, WHITE);
             paint_block(canvas, cw, pos_x + ex + sx, pos_y + ey + sy, s, PUPIL);
@@ -246,6 +281,16 @@ struct PetApp {
     dragging: bool,
     hovered: bool,
     audio: Option<OutputStreamHandle>,
+    scale: u32,
+    disp_w: u32,
+    disp_h: u32,
+    body_l: i32,
+    body_r: i32,
+    walk_px: i32,
+    anim_ms: u32,
+    volume: f32,
+    chase_start: f64,
+    chase_stop: f64,
     drag_start_pos_x: i32,
     drag_start_pos_y: i32,
     drag_start_local_x: f64,
@@ -283,10 +328,10 @@ impl PetApp {
         let src_y_off = (-self.pos_y).max(0) as usize;
         let dst_x = self.pos_x.max(0) as usize;
         let dst_y = self.pos_y.max(0) as usize;
-        let copy_w = ((DISP_W as i32 - src_x_off as i32)
+        let copy_w = ((self.disp_w as i32 - src_x_off as i32)
             .min(width as i32 - dst_x as i32))
             .max(0) as usize;
-        let copy_h = ((DISP_H as i32 - src_y_off as i32)
+        let copy_h = ((self.disp_h as i32 - src_y_off as i32)
             .min(height as i32 - dst_y as i32))
             .max(0) as usize;
 
@@ -313,13 +358,13 @@ impl PetApp {
             canvas.fill(0);
             for row in 0..copy_h {
                 if copy_w == 0 { break; }
-                let src = (row + src_y_off) * DISP_W as usize * 4 + src_x_off * 4;
+                let src = (row + src_y_off) * self.disp_w as usize * 4 + src_x_off * 4;
                 let dst = (dst_y + row) * width as usize * 4 + dst_x * 4;
                 canvas[dst..dst + copy_w * 4]
                     .copy_from_slice(&frame_data[src..src + copy_w * 4]);
             }
             if matches!(draw_state, State::Idle | State::Alert) {
-                shift_pupils(canvas, width as usize, pos_x, pos_y, cursor_x, cursor_y, facing_right, draw_state);
+                shift_pupils(canvas, width as usize, pos_x, pos_y, cursor_x, cursor_y, facing_right, draw_state, self.scale, self.disp_w);
             }
             buffer
         };
@@ -328,13 +373,13 @@ impl PetApp {
         if self.dragging {
             region.wl_region().add(0, 0, width as i32, height as i32);
         } else {
-            let body_t = self.state.body_top();
-            let ir_x = (self.pos_x + BODY_L).max(0);
+            let body_t = self.state.body_top_src() * self.scale as i32;
+            let ir_x = (self.pos_x + self.body_l).max(0);
             let ir_y = (self.pos_y + body_t).max(0);
-            let ir_w = (DISP_W as i32 - BODY_L - BODY_R)
+            let ir_w = (self.disp_w as i32 - self.body_l - self.body_r)
                 .min(width as i32 - ir_x)
                 .max(0);
-            let ir_h = ((self.pos_y + DISP_H as i32).min(height as i32) - ir_y).max(0);
+            let ir_h = ((self.pos_y + self.disp_h as i32).min(height as i32) - ir_y).max(0);
             region.wl_region().add(ir_x, ir_y, ir_w, ir_h);
         }
 
@@ -384,7 +429,7 @@ impl CompositorHandler for PetApp {
             self.state_start_ms = time;
         }
 
-        if time.wrapping_sub(self.last_anim_ms) >= ANIM_MS {
+        if time.wrapping_sub(self.last_anim_ms) >= self.anim_ms {
             let next = (self.frame_idx + 1) % self.state.frame_count();
             if next == 0 && matches!(self.state, State::Jump | State::Pet) {
                 self.state = if self.state == State::Pet && self.hovered { State::Alert } else { State::Idle };
@@ -405,27 +450,27 @@ impl CompositorHandler for PetApp {
         }
 
         if !self.dragging && !matches!(self.state, State::Alert | State::Jump | State::Pet) {
-            let cat_cx = self.pos_x as f64 + DISP_W as f64 / 2.0;
-            let cat_cy = self.pos_y as f64 + DISP_H as f64 / 2.0;
+            let cat_cx = self.pos_x as f64 + self.disp_w as f64 / 2.0;
+            let cat_cy = self.pos_y as f64 + self.disp_h as f64 / 2.0;
             let dx = self.cursor_x - cat_cx;
             let dy = self.cursor_y - cat_cy;
             let dist = (dx * dx + dy * dy).sqrt();
 
             if self.state == State::Walk {
-                if dist < CHASE_STOP_PX {
+                if dist < self.chase_stop {
                     self.state = State::Idle;
                     self.state_start_ms = time;
                     self.frame_idx = 0;
                 } else {
-                    self.vel_x = if dx > 0.0 { WALK_PX } else { -WALK_PX };
-                    self.pos_x += (dx / dist * WALK_PX as f64).round() as i32;
-                    self.pos_y += (dy / dist * WALK_PX as f64).round() as i32;
-                    let max_x = (self.width as i32 - DISP_W as i32 + BODY_R).max(0);
-                    let max_y = (self.height as i32 - DISP_H as i32).max(0);
-                    self.pos_x = self.pos_x.clamp(-BODY_L, max_x);
-                    self.pos_y = self.pos_y.clamp(-self.state.body_top(), max_y);
+                    self.vel_x = if dx > 0.0 { self.walk_px } else { -self.walk_px };
+                    self.pos_x += (dx / dist * self.walk_px as f64).round() as i32;
+                    self.pos_y += (dy / dist * self.walk_px as f64).round() as i32;
+                    let max_x = (self.width as i32 - self.disp_w as i32 + self.body_r).max(0);
+                    let max_y = (self.height as i32 - self.disp_h as i32).max(0);
+                    self.pos_x = self.pos_x.clamp(-self.body_l, max_x);
+                    self.pos_y = self.pos_y.clamp(-self.state.body_top_src() * self.scale as i32, max_y);
                 }
-            } else if dist > CHASE_START_PX {
+            } else if dist > self.chase_start {
                 self.state = State::Walk;
                 self.state_start_ms = time;
                 self.frame_idx = 0;
@@ -510,7 +555,7 @@ impl PointerHandler for PetApp {
                     self.hovered = true;
                     self.state = State::Alert;
                     self.frame_idx = 0;
-                    if let Some(h) = &self.audio { play(h, "assets/sounds/meow.wav"); }
+                    if let Some(h) = &self.audio { play(h, "assets/sounds/meow.wav", self.volume); }
                 }
                 PointerEventKind::Leave { .. } if !self.dragging => {
                     self.hovered = false;
@@ -525,7 +570,7 @@ impl PointerHandler for PetApp {
                         self.state = State::Pet;
                         self.state_start_ms = self.last_anim_ms;
                         self.frame_idx = 0;
-                        if let Some(h) = &self.audio { play(h, "assets/sounds/purr.wav"); }
+                        if let Some(h) = &self.audio { play(h, "assets/sounds/purr.wav", self.volume); }
                     } else {
                         self.dragging = true;
                         self.vel_y = 0;
@@ -539,12 +584,12 @@ impl PointerHandler for PetApp {
                     self.cursor_x = event.position.0;
                     self.cursor_y = event.position.1;
                     if self.dragging {
-                        let max_x = (self.width as i32 - DISP_W as i32 + BODY_R).max(0);
-                        let max_y = (self.height as i32 - DISP_H as i32).max(0);
-                        let min_y = -self.state.body_top();
+                        let max_x = (self.width as i32 - self.disp_w as i32 + self.body_r).max(0);
+                        let max_y = (self.height as i32 - self.disp_h as i32).max(0);
+                        let min_y = -self.state.body_top_src() * self.scale as i32;
                         self.pos_x = (self.drag_start_pos_x
                             + (event.position.0 - self.drag_start_local_x) as i32)
-                            .clamp(-BODY_L, max_x);
+                            .clamp(-self.body_l, max_x);
                         self.pos_y = (self.drag_start_pos_y
                             + (event.position.1 - self.drag_start_local_y) as i32)
                             .clamp(min_y, max_y);
@@ -605,8 +650,8 @@ impl LayerShellHandler for PetApp {
             self.height = configure.new_size.1;
         }
 
-        if !self.pos_y_initialized && self.height > DISP_H {
-            self.pos_y = self.height as i32 - DISP_H as i32 - CAT_BOTTOM_MARGIN;
+        if !self.pos_y_initialized && self.height > self.disp_h {
+            self.pos_y = self.height as i32 - self.disp_h as i32 - CAT_BOTTOM_MARGIN;
             self.pos_y_initialized = true;
         }
 
@@ -641,17 +686,24 @@ fn main() {
         .expect("Failed to open assets/sheet.png")
         .into_rgba8();
 
-    let walk  = load_anim(&sheet, 4, 8);
-    let idle  = load_anim(&sheet, 0, 4);
-    let sleep = load_anim(&sheet, 6, 4);
-    let alert = load_anim(&sheet, 7, 4);
-    let jump  = load_anim(&sheet, 8, 4);
-    let pet   = load_anim(&sheet, 3, 4);
+    let cfg = load_config();
+    let disp_w = FRAME_W * cfg.scale;
+    let disp_h = FRAME_H * cfg.scale;
+    let body_l = BODY_L_SRC * cfg.scale as i32;
+    let body_r = BODY_R_SRC * cfg.scale as i32;
 
-    let audio = rodio::OutputStream::try_default().ok().map(|(_s, h)| {
-        std::mem::forget(_s);
-        h
-    });
+    let walk  = load_anim(&sheet, 4, 8, disp_w, disp_h);
+    let idle  = load_anim(&sheet, 0, 4, disp_w, disp_h);
+    let sleep = load_anim(&sheet, 6, 4, disp_w, disp_h);
+    let alert = load_anim(&sheet, 7, 4, disp_w, disp_h);
+    let jump  = load_anim(&sheet, 8, 4, disp_w, disp_h);
+    let pet   = load_anim(&sheet, 3, 4, disp_w, disp_h);
+
+    let audio = if cfg.sound {
+        rodio::OutputStream::try_default().ok().map(|(_s, h)| { std::mem::forget(_s); h })
+    } else {
+        None
+    };
 
     let conn = Connection::connect_to_env()
         .expect("Could not connect to Wayland display. Is $WAYLAND_DISPLAY set?");
@@ -668,8 +720,8 @@ fn main() {
             .expect("zwlr_layer_shell_v1 not available"),
         layer_surface: None,
         pool: None,
-        width: DISP_W,
-        height: DISP_H,
+        width: disp_w,
+        height: disp_h,
         running: true,
         walk,
         idle,
@@ -683,13 +735,23 @@ fn main() {
         last_anim_ms: 0,
         pos_x: 0,
         pos_y: 0,
-        vel_x: WALK_PX,
+        vel_x: cfg.speed,
         pos_y_initialized: false,
         seat_state: SeatState::new(&globals, &qh),
         pointer: None,
         dragging: false,
         hovered: false,
         audio,
+        scale: cfg.scale,
+        disp_w,
+        disp_h,
+        body_l,
+        body_r,
+        walk_px: cfg.speed,
+        anim_ms: cfg.anim_ms,
+        volume: cfg.volume,
+        chase_start: cfg.chase_start,
+        chase_stop: cfg.chase_stop,
         drag_start_pos_x: 0,
         drag_start_pos_y: 0,
         drag_start_local_x: 0.0,
