@@ -115,6 +115,80 @@ fn load_anim(
     Frames { right, left }
 }
 
+fn hyprland_cursor_pos() -> Option<(f64, f64)> {
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+    let sig = std::env::var("HYPRLAND_INSTANCE_SIGNATURE").ok()?;
+    let xdg = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
+    let path = format!("{}/hypr/{}/.socket.sock", xdg, sig);
+    let mut s = UnixStream::connect(&path).ok()?;
+    s.write_all(b"cursorpos").ok()?;
+    let mut buf = String::new();
+    s.read_to_string(&mut buf).ok()?;
+    let (xs, ys) = buf.trim().split_once(',')?;
+    Some((xs.trim().parse().ok()?, ys.trim().parse().ok()?))
+}
+
+fn paint_block(canvas: &mut [u8], cw: usize, x: i32, y: i32, size: i32, color: [u8; 4]) {
+    for dy in 0..size {
+        for dx in 0..size {
+            let px = x + dx;
+            let py = y + dy;
+            if px >= 0 && py >= 0 {
+                let i = (py as usize * cw + px as usize) * 4;
+                if i + 4 <= canvas.len() {
+                    canvas[i..i + 4].copy_from_slice(&color);
+                }
+            }
+        }
+    }
+}
+
+fn shift_pupils(
+    canvas: &mut [u8],
+    cw: usize,
+    pos_x: i32,
+    pos_y: i32,
+    cursor_x: f64,
+    cursor_y: f64,
+    facing_right: bool,
+    state: State,
+) {
+    let s = SCALE as i32;
+    let face_cx = pos_x as f64 + DISP_W as f64 * 0.5;
+    let face_cy = pos_y as f64 + 22.0 * SCALE as f64;
+    let ddx = cursor_x - face_cx;
+    let ddy = cursor_y - face_cy;
+    let dist = (ddx * ddx + ddy * ddy).sqrt();
+    let (sx, sy) = if dist < 5.0 {
+        (0, 0)
+    } else {
+        (ddx.signum() as i32 * s, (ddy / dist).round() as i32 * s)
+    };
+
+    const PUPIL: [u8; 4] = [46, 47, 47, 255];
+    const GRAY:  [u8; 4] = [181, 181, 181, 255];
+    const WHITE: [u8; 4] = [224, 224, 224, 255];
+
+    match state {
+        State::Idle => {
+            let eyes: &[i32] = if facing_right { &[48, 57] } else { &[36, 45] };
+            let ey = 23 * s;
+            for &ex in eyes {
+                paint_block(canvas, cw, pos_x + ex, pos_y + ey, s, GRAY);
+                paint_block(canvas, cw, pos_x + ex + sx, pos_y + ey + sy, s, PUPIL);
+            }
+        }
+        State::Alert => {
+            let ex = if facing_right { 19 * s } else { DISP_W as i32 - 19 * s - s };
+            let ey = 25 * s;
+            paint_block(canvas, cw, pos_x + ex, pos_y + ey, s, WHITE);
+            paint_block(canvas, cw, pos_x + ex + sx, pos_y + ey + sy, s, PUPIL);
+        }
+        _ => {}
+    }
+}
+
 fn flip_h(frame: &[u8], w: u32, h: u32) -> Vec<u8> {
     let (w, h) = (w as usize, h as usize);
     let mut out = vec![0u8; frame.len()];
@@ -159,6 +233,10 @@ struct PetApp {
     drag_start_pos_y: i32,
     drag_start_local_x: f64,
     drag_start_local_y: f64,
+    cursor_x: f64,
+    cursor_y: f64,
+    monitor_x: i32,
+    monitor_y: i32,
 }
 
 impl PetApp {
@@ -193,6 +271,13 @@ impl PetApp {
             .min(height as i32 - dst_y as i32))
             .max(0) as usize;
 
+        let cursor_x = self.cursor_x;
+        let cursor_y = self.cursor_y;
+        let draw_state = self.state;
+        let facing_right = self.vel_x >= 0;
+        let pos_x = self.pos_x;
+        let pos_y = self.pos_y;
+
         let buffer = {
             let pool = match self.pool.as_mut() {
                 Some(p) => p,
@@ -213,6 +298,9 @@ impl PetApp {
                 let dst = (dst_y + row) * width as usize * 4 + dst_x * 4;
                 canvas[dst..dst + copy_w * 4]
                     .copy_from_slice(&frame_data[src..src + copy_w * 4]);
+            }
+            if matches!(draw_state, State::Idle | State::Alert) {
+                shift_pupils(canvas, width as usize, pos_x, pos_y, cursor_x, cursor_y, facing_right, draw_state);
             }
             buffer
         };
@@ -267,6 +355,11 @@ impl CompositorHandler for PetApp {
         _: &wl_surface::WlSurface,
         time: u32,
     ) {
+        if let Some((cx, cy)) = hyprland_cursor_pos() {
+            self.cursor_x = cx - self.monitor_x as f64;
+            self.cursor_y = cy - self.monitor_y as f64;
+        }
+
         if self.last_anim_ms == 0 {
             self.last_anim_ms = time;
             self.state_start_ms = time;
@@ -312,8 +405,14 @@ impl CompositorHandler for PetApp {
         _: &Connection,
         _: &QueueHandle<Self>,
         _: &wl_surface::WlSurface,
-        _: &wl_output::WlOutput,
+        output: &wl_output::WlOutput,
     ) {
+        if let Some(info) = self.output_state.info(output) {
+            if let Some(pos) = info.logical_position {
+                self.monitor_x = pos.0;
+                self.monitor_y = pos.1;
+            }
+        }
     }
 
     fn surface_leave(
@@ -371,6 +470,8 @@ impl PointerHandler for PetApp {
         for event in events {
             match event.kind {
                 PointerEventKind::Enter { .. } if !self.dragging => {
+                    self.cursor_x = event.position.0;
+                    self.cursor_y = event.position.1;
                     self.state = State::Alert;
                     self.frame_idx = 0;
                 }
@@ -388,16 +489,20 @@ impl PointerHandler for PetApp {
                     self.drag_start_local_x = event.position.0;
                     self.drag_start_local_y = event.position.1;
                 }
-                PointerEventKind::Motion { .. } if self.dragging => {
-                    let max_x = (self.width as i32 - DISP_W as i32 + BODY_R).max(0);
-                    let max_y = (self.height as i32 - DISP_H as i32).max(0);
-                    let min_y = -self.state.body_top();
-                    self.pos_x = (self.drag_start_pos_x
-                        + (event.position.0 - self.drag_start_local_x) as i32)
-                        .clamp(-BODY_L, max_x);
-                    self.pos_y = (self.drag_start_pos_y
-                        + (event.position.1 - self.drag_start_local_y) as i32)
-                        .clamp(min_y, max_y);
+                PointerEventKind::Motion { .. } => {
+                    self.cursor_x = event.position.0;
+                    self.cursor_y = event.position.1;
+                    if self.dragging {
+                        let max_x = (self.width as i32 - DISP_W as i32 + BODY_R).max(0);
+                        let max_y = (self.height as i32 - DISP_H as i32).max(0);
+                        let min_y = -self.state.body_top();
+                        self.pos_x = (self.drag_start_pos_x
+                            + (event.position.0 - self.drag_start_local_x) as i32)
+                            .clamp(-BODY_L, max_x);
+                        self.pos_y = (self.drag_start_pos_y
+                            + (event.position.1 - self.drag_start_local_y) as i32)
+                            .clamp(min_y, max_y);
+                    }
                 }
                 PointerEventKind::Release { button, .. } if button == BTN_LEFT => {
                     self.dragging = false;
@@ -532,6 +637,10 @@ fn main() {
         drag_start_pos_y: 0,
         drag_start_local_x: 0.0,
         drag_start_local_y: 0.0,
+        cursor_x: 0.0,
+        cursor_y: 0.0,
+        monitor_x: 0,
+        monitor_y: 0,
     };
 
     let surface = app.compositor_state.create_surface(&qh);
