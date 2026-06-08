@@ -45,6 +45,7 @@ enum State {
     Sleep,
     Alert,
     Jump,
+    Pet,
 }
 
 impl State {
@@ -55,6 +56,7 @@ impl State {
             State::Sleep => 4,
             State::Alert => 4,
             State::Jump  => 4,
+            State::Pet   => 4,
         }
     }
 
@@ -63,15 +65,15 @@ impl State {
             State::Walk  => 8_000 + (time % 6_000),
             State::Idle  => 3_000 + (time % 4_000),
             State::Sleep => 8_000 + (time % 8_000),
-            State::Alert | State::Jump => u32::MAX,
+            State::Alert | State::Jump | State::Pet => u32::MAX,
         }
     }
 
     fn body_top(self) -> i32 {
         match self {
-            State::Sleep => 72,
-            State::Jump  => 42,
-            _            => 60,
+            State::Sleep | State::Pet => 72,
+            State::Jump               => 42,
+            _                         => 60,
         }
     }
 
@@ -80,7 +82,7 @@ impl State {
             State::Walk  => State::Idle,
             State::Idle  => if (time / 1_000) % 3 == 0 { State::Sleep } else { State::Walk },
             State::Sleep => State::Idle,
-            State::Alert | State::Jump => State::Idle,
+            State::Alert | State::Jump | State::Pet => State::Idle,
         }
     }
 }
@@ -220,6 +222,7 @@ struct PetApp {
     sleep: Frames,
     alert: Frames,
     jump: Frames,
+    pet: Frames,
     state: State,
     state_start_ms: u32,
     frame_idx: usize,
@@ -231,6 +234,7 @@ struct PetApp {
     seat_state: SeatState,
     pointer: Option<wl_pointer::WlPointer>,
     dragging: bool,
+    hovered: bool,
     drag_start_pos_x: i32,
     drag_start_pos_y: i32,
     drag_start_local_x: f64,
@@ -256,6 +260,7 @@ impl PetApp {
             State::Sleep => &self.sleep,
             State::Alert => &self.alert,
             State::Jump  => &self.jump,
+            State::Pet   => &self.pet,
         };
         let frame_data: &[u8] = if self.vel_x >= 0 {
             &frames.right[self.frame_idx]
@@ -370,8 +375,8 @@ impl CompositorHandler for PetApp {
 
         if time.wrapping_sub(self.last_anim_ms) >= ANIM_MS {
             let next = (self.frame_idx + 1) % self.state.frame_count();
-            if next == 0 && self.state == State::Jump {
-                self.state = State::Idle;
+            if next == 0 && matches!(self.state, State::Jump | State::Pet) {
+                self.state = if self.state == State::Pet && self.hovered { State::Alert } else { State::Idle };
                 self.state_start_ms = time;
                 self.frame_idx = 0;
             } else {
@@ -380,7 +385,7 @@ impl CompositorHandler for PetApp {
             self.last_anim_ms = time;
         }
 
-        if !self.dragging && !matches!(self.state, State::Alert | State::Jump | State::Walk) {
+        if !self.dragging && !matches!(self.state, State::Alert | State::Jump | State::Pet | State::Walk) {
             if time.wrapping_sub(self.state_start_ms) >= self.state.duration_ms(time) {
                 self.state = self.state.next(time);
                 self.state_start_ms = time;
@@ -388,7 +393,7 @@ impl CompositorHandler for PetApp {
             }
         }
 
-        if !self.dragging && !matches!(self.state, State::Alert | State::Jump) {
+        if !self.dragging && !matches!(self.state, State::Alert | State::Jump | State::Pet) {
             let cat_cx = self.pos_x as f64 + DISP_W as f64 / 2.0;
             let cat_cy = self.pos_y as f64 + DISP_H as f64 / 2.0;
             let dx = self.cursor_x - cat_cx;
@@ -491,23 +496,31 @@ impl PointerHandler for PetApp {
                 PointerEventKind::Enter { .. } if !self.dragging => {
                     self.cursor_x = event.position.0;
                     self.cursor_y = event.position.1;
+                    self.hovered = true;
                     self.state = State::Alert;
                     self.frame_idx = 0;
                 }
                 PointerEventKind::Leave { .. } if !self.dragging => {
-                    if self.state == State::Alert {
+                    self.hovered = false;
+                    if matches!(self.state, State::Alert | State::Pet) {
                         self.state = State::Idle;
                         self.state_start_ms = self.last_anim_ms;
                         self.frame_idx = 0;
                     }
                 }
                 PointerEventKind::Press { button, .. } if button == BTN_LEFT => {
-                    self.dragging = true;
-                    self.vel_y = 0;
-                    self.drag_start_pos_x = self.pos_x;
-                    self.drag_start_pos_y = self.pos_y;
-                    self.drag_start_local_x = event.position.0;
-                    self.drag_start_local_y = event.position.1;
+                    if matches!(self.state, State::Alert | State::Pet) {
+                        self.state = State::Pet;
+                        self.state_start_ms = self.last_anim_ms;
+                        self.frame_idx = 0;
+                    } else {
+                        self.dragging = true;
+                        self.vel_y = 0;
+                        self.drag_start_pos_x = self.pos_x;
+                        self.drag_start_pos_y = self.pos_y;
+                        self.drag_start_local_x = event.position.0;
+                        self.drag_start_local_y = event.position.1;
+                    }
                 }
                 PointerEventKind::Motion { .. } => {
                     self.cursor_x = event.position.0;
@@ -525,10 +538,12 @@ impl PointerHandler for PetApp {
                     }
                 }
                 PointerEventKind::Release { button, .. } if button == BTN_LEFT => {
-                    self.dragging = false;
-                    self.state = State::Jump;
-                    self.state_start_ms = self.last_anim_ms;
-                    self.frame_idx = 0;
+                    if self.dragging {
+                        self.dragging = false;
+                        self.state = State::Jump;
+                        self.state_start_ms = self.last_anim_ms;
+                        self.frame_idx = 0;
+                    }
                 }
                 _ => {}
             }
@@ -618,6 +633,7 @@ fn main() {
     let sleep = load_anim(&sheet, 6, 4);
     let alert = load_anim(&sheet, 7, 4);
     let jump  = load_anim(&sheet, 8, 4);
+    let pet   = load_anim(&sheet, 3, 4);
 
     let conn = Connection::connect_to_env()
         .expect("Could not connect to Wayland display. Is $WAYLAND_DISPLAY set?");
@@ -642,6 +658,7 @@ fn main() {
         sleep,
         alert,
         jump,
+        pet,
         state: State::Walk,
         state_start_ms: 0,
         frame_idx: 0,
@@ -653,6 +670,7 @@ fn main() {
         seat_state: SeatState::new(&globals, &qh),
         pointer: None,
         dragging: false,
+        hovered: false,
         drag_start_pos_x: 0,
         drag_start_pos_y: 0,
         drag_start_local_x: 0.0,
