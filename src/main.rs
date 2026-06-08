@@ -33,7 +33,8 @@ const DISP_H: u32 = FRAME_H * SCALE;
 const WALK_PX: i32 = 2;
 const ANIM_MS: u32 = 120;
 const CAT_BOTTOM_MARGIN: i32 = 16;
-const GRAVITY: i32 = 1;
+const CHASE_STOP_PX: f64 = 48.0;
+const CHASE_START_PX: f64 = 120.0;
 const BODY_L: i32 = 21;
 const BODY_R: i32 = 21;
 
@@ -368,46 +369,50 @@ impl CompositorHandler for PetApp {
         }
 
         if time.wrapping_sub(self.last_anim_ms) >= ANIM_MS {
-            self.frame_idx = (self.frame_idx + 1) % self.state.frame_count();
+            let next = (self.frame_idx + 1) % self.state.frame_count();
+            if next == 0 && self.state == State::Jump {
+                self.state = State::Idle;
+                self.state_start_ms = time;
+                self.frame_idx = 0;
+            } else {
+                self.frame_idx = next;
+            }
             self.last_anim_ms = time;
         }
 
-        if !self.dragging && !matches!(self.state, State::Alert | State::Jump) {
+        if !self.dragging && !matches!(self.state, State::Alert | State::Jump | State::Walk) {
             if time.wrapping_sub(self.state_start_ms) >= self.state.duration_ms(time) {
                 self.state = self.state.next(time);
                 self.state_start_ms = time;
                 self.frame_idx = 0;
             }
-
-            if self.state == State::Walk {
-                self.pos_x += self.vel_x;
-                let max_x = (self.width as i32 - DISP_W as i32 + BODY_R).max(0);
-                if self.pos_x <= -BODY_L {
-                    self.pos_x = -BODY_L;
-                    self.vel_x = WALK_PX;
-                } else if self.pos_x >= max_x {
-                    self.pos_x = max_x;
-                    self.vel_x = -WALK_PX;
-                }
-            }
         }
 
-        let floor = self.height as i32 - DISP_H as i32 - CAT_BOTTOM_MARGIN;
-        if !self.dragging {
-            if self.pos_y < floor {
-                self.vel_y = (self.vel_y + GRAVITY).min(20);
-                self.pos_y += self.vel_y;
-                if self.pos_y >= floor {
-                    self.pos_y = floor;
-                    self.vel_y = 0;
-                    if self.state == State::Jump {
-                        self.state = State::Idle;
-                        self.state_start_ms = time;
-                        self.frame_idx = 0;
-                    }
+        if !self.dragging && !matches!(self.state, State::Alert | State::Jump) {
+            let cat_cx = self.pos_x as f64 + DISP_W as f64 / 2.0;
+            let cat_cy = self.pos_y as f64 + DISP_H as f64 / 2.0;
+            let dx = self.cursor_x - cat_cx;
+            let dy = self.cursor_y - cat_cy;
+            let dist = (dx * dx + dy * dy).sqrt();
+
+            if self.state == State::Walk {
+                if dist < CHASE_STOP_PX {
+                    self.state = State::Idle;
+                    self.state_start_ms = time;
+                    self.frame_idx = 0;
+                } else {
+                    self.vel_x = if dx > 0.0 { WALK_PX } else { -WALK_PX };
+                    self.pos_x += (dx / dist * WALK_PX as f64).round() as i32;
+                    self.pos_y += (dy / dist * WALK_PX as f64).round() as i32;
+                    let max_x = (self.width as i32 - DISP_W as i32 + BODY_R).max(0);
+                    let max_y = (self.height as i32 - DISP_H as i32).max(0);
+                    self.pos_x = self.pos_x.clamp(-BODY_L, max_x);
+                    self.pos_y = self.pos_y.clamp(-self.state.body_top(), max_y);
                 }
-            } else {
-                self.vel_y = 0;
+            } else if dist > CHASE_START_PX {
+                self.state = State::Walk;
+                self.state_start_ms = time;
+                self.frame_idx = 0;
             }
         }
 
