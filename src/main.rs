@@ -33,6 +33,7 @@ const DISP_H: u32 = FRAME_H * SCALE;
 const WALK_PX: i32 = 2;
 const ANIM_MS: u32 = 120;
 const CAT_BOTTOM_MARGIN: i32 = 16;
+const GRAVITY: i32 = 1;
 const BODY_L: i32 = 21;
 const BODY_R: i32 = 21;
 
@@ -233,6 +234,7 @@ struct PetApp {
     drag_start_pos_y: i32,
     drag_start_local_x: f64,
     drag_start_local_y: f64,
+    vel_y: i32,
     cursor_x: f64,
     cursor_y: f64,
     monitor_x: i32,
@@ -366,14 +368,7 @@ impl CompositorHandler for PetApp {
         }
 
         if time.wrapping_sub(self.last_anim_ms) >= ANIM_MS {
-            let next = (self.frame_idx + 1) % self.state.frame_count();
-            if next == 0 && self.state == State::Jump {
-                self.state = State::Idle;
-                self.state_start_ms = time;
-                self.frame_idx = 0;
-            } else {
-                self.frame_idx = next;
-            }
+            self.frame_idx = (self.frame_idx + 1) % self.state.frame_count();
             self.last_anim_ms = time;
         }
 
@@ -394,6 +389,25 @@ impl CompositorHandler for PetApp {
                     self.pos_x = max_x;
                     self.vel_x = -WALK_PX;
                 }
+            }
+        }
+
+        let floor = self.height as i32 - DISP_H as i32 - CAT_BOTTOM_MARGIN;
+        if !self.dragging {
+            if self.pos_y < floor {
+                self.vel_y = (self.vel_y + GRAVITY).min(20);
+                self.pos_y += self.vel_y;
+                if self.pos_y >= floor {
+                    self.pos_y = floor;
+                    self.vel_y = 0;
+                    if self.state == State::Jump {
+                        self.state = State::Idle;
+                        self.state_start_ms = time;
+                        self.frame_idx = 0;
+                    }
+                }
+            } else {
+                self.vel_y = 0;
             }
         }
 
@@ -484,6 +498,7 @@ impl PointerHandler for PetApp {
                 }
                 PointerEventKind::Press { button, .. } if button == BTN_LEFT => {
                     self.dragging = true;
+                    self.vel_y = 0;
                     self.drag_start_pos_x = self.pos_x;
                     self.drag_start_pos_y = self.pos_y;
                     self.drag_start_local_x = event.position.0;
@@ -637,6 +652,7 @@ fn main() {
         drag_start_pos_y: 0,
         drag_start_local_x: 0.0,
         drag_start_local_y: 0.0,
+        vel_y: 0,
         cursor_x: 0.0,
         cursor_y: 0.0,
         monitor_x: 0,
