@@ -1,3 +1,5 @@
+use rodio::{Decoder, OutputStreamHandle, Source};
+
 use wayland_client::{
     globals::registry_queue_init,
     protocol::{wl_output, wl_pointer, wl_seat, wl_shm, wl_surface},
@@ -83,6 +85,14 @@ impl State {
             State::Idle  => if (time / 1_000) % 3 == 0 { State::Sleep } else { State::Walk },
             State::Sleep => State::Idle,
             State::Alert | State::Jump | State::Pet => State::Idle,
+        }
+    }
+}
+
+fn play(handle: &OutputStreamHandle, path: &str) {
+    if let Ok(file) = std::fs::File::open(path) {
+        if let Ok(source) = Decoder::new(std::io::BufReader::new(file)) {
+            let _ = handle.play_raw(source.convert_samples());
         }
     }
 }
@@ -235,6 +245,7 @@ struct PetApp {
     pointer: Option<wl_pointer::WlPointer>,
     dragging: bool,
     hovered: bool,
+    audio: Option<OutputStreamHandle>,
     drag_start_pos_x: i32,
     drag_start_pos_y: i32,
     drag_start_local_x: f64,
@@ -499,6 +510,7 @@ impl PointerHandler for PetApp {
                     self.hovered = true;
                     self.state = State::Alert;
                     self.frame_idx = 0;
+                    if let Some(h) = &self.audio { play(h, "assets/sounds/meow.wav"); }
                 }
                 PointerEventKind::Leave { .. } if !self.dragging => {
                     self.hovered = false;
@@ -513,6 +525,7 @@ impl PointerHandler for PetApp {
                         self.state = State::Pet;
                         self.state_start_ms = self.last_anim_ms;
                         self.frame_idx = 0;
+                        if let Some(h) = &self.audio { play(h, "assets/sounds/purr.wav"); }
                     } else {
                         self.dragging = true;
                         self.vel_y = 0;
@@ -635,6 +648,11 @@ fn main() {
     let jump  = load_anim(&sheet, 8, 4);
     let pet   = load_anim(&sheet, 3, 4);
 
+    let audio = rodio::OutputStream::try_default().ok().map(|(_s, h)| {
+        std::mem::forget(_s);
+        h
+    });
+
     let conn = Connection::connect_to_env()
         .expect("Could not connect to Wayland display. Is $WAYLAND_DISPLAY set?");
     let (globals, mut event_queue) = registry_queue_init(&conn).unwrap();
@@ -671,6 +689,7 @@ fn main() {
         pointer: None,
         dragging: false,
         hovered: false,
+        audio,
         drag_start_pos_x: 0,
         drag_start_pos_y: 0,
         drag_start_local_x: 0.0,

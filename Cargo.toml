@@ -7,3 +7,4 @@ edition = "2024"
 smithay-client-toolkit = "0.19"
 wayland-client = "0.31"
 image = { version = "0.25", default-features = false, features = ["png"] }
+rodio = { version = "0.17", default-features = false, features = ["wav", "vorbis"] }
