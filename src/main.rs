@@ -1,4 +1,5 @@
 use rodio::{Decoder, OutputStreamHandle, Source};
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 
 use wayland_client::{
     globals::registry_queue_init,
@@ -30,18 +31,19 @@ use smithay_client_toolkit::{
 #[derive(serde::Deserialize)]
 #[serde(default)]
 struct Config {
-    scale:       u32,
-    speed:       i32,
-    anim_ms:     u32,
-    sound:       bool,
-    volume:      f32,
-    chase_start: f64,
-    chase_stop:  f64,
+    scale:  u32,
+    anim_ms: u32,
+    sound:  bool,
+    volume: f32,
+    corner: String,
+    stretch_every_secs: u64,
+    stretch_anim_ms: u32,
+    stretch_hold_ms: u32,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Self { scale: 3, speed: 2, anim_ms: 120, sound: true, volume: 1.0, chase_start: 120.0, chase_stop: 48.0 }
+        Self { scale: 3, anim_ms: 120, sound: true, volume: 1.0, corner: "bottom-right".into(), stretch_every_secs: 1800, stretch_anim_ms: 400, stretch_hold_ms: 1500 }
     }
 }
 
@@ -53,7 +55,7 @@ fn load_config() -> Config {
     if !path.exists() {
         let _ = std::fs::create_dir_all(path.parent().unwrap());
         let _ = std::fs::write(&path,
-            "scale       = 3\nspeed       = 2\nanim_ms     = 120\nsound       = true\nvolume      = 1.0\nchase_start = 120.0\nchase_stop  = 48.0\n");
+            "scale   = 3\nanim_ms = 120\nsound   = true\nvolume  = 1.0\ncorner  = \"bottom-right\"\nstretch_every_secs = 1800\nstretch_anim_ms = 400\nstretch_hold_ms = 1500\n");
     }
     std::fs::read_to_string(&path).ok()
         .and_then(|s| toml::from_str(&s).ok())
@@ -62,9 +64,32 @@ fn load_config() -> Config {
 
 const FRAME_W: u32 = 32;
 const FRAME_H: u32 = 32;
-const BODY_L_SRC: i32 = 7;
-const BODY_R_SRC: i32 = 7;
+const BODY_L_SRC: i32 = 3;
+const BODY_R_SRC: i32 = 10;
 const CAT_BOTTOM_MARGIN: i32 = 16;
+
+fn start_keyboard_watcher(flag: Arc<AtomicBool>) {
+    for i in 0..32 {
+        let path = format!("/dev/input/event{}", i);
+        if let Ok(file) = std::fs::OpenOptions::new().read(true).open(&path) {
+            let flag = flag.clone();
+            std::thread::spawn(move || {
+                use std::io::Read;
+                let mut f = file;
+                let mut buf = [0u8; 24];
+                loop {
+                    if f.read_exact(&mut buf).is_err() { break; }
+                    let ev_type  = u16::from_ne_bytes([buf[16], buf[17]]);
+                    let ev_code  = u16::from_ne_bytes([buf[18], buf[19]]);
+                    let ev_value = i32::from_ne_bytes([buf[20], buf[21], buf[22], buf[23]]);
+                    if ev_type == 1 && ev_value == 1 && ev_code < 256 {
+                        flag.store(true, Ordering::Relaxed);
+                    }
+                }
+            });
+        }
+    }
+}
 
 #[derive(Clone, Copy, PartialEq)]
 enum State {
@@ -74,17 +99,23 @@ enum State {
     Alert,
     Jump,
     Pet,
+    Typing,
+    Drag,
+    Stretch,
 }
 
 impl State {
     fn frame_count(self) -> usize {
         match self {
-            State::Walk  => 8,
-            State::Idle  => 4,
-            State::Sleep => 4,
-            State::Alert => 4,
-            State::Jump  => 4,
-            State::Pet   => 4,
+            State::Walk   => 4,
+            State::Idle   => 4,
+            State::Sleep  => 4,
+            State::Alert  => 4,
+            State::Jump   => 4,
+            State::Pet    => 4,
+            State::Typing   => 4,
+            State::Drag     => 4,
+            State::Stretch  => 4,
         }
     }
 
@@ -93,24 +124,23 @@ impl State {
             State::Walk  => 8_000 + (time % 6_000),
             State::Idle  => 3_000 + (time % 4_000),
             State::Sleep => 8_000 + (time % 8_000),
-            State::Alert | State::Jump | State::Pet => u32::MAX,
+            State::Alert | State::Jump | State::Pet | State::Typing | State::Drag | State::Stretch => u32::MAX,
         }
     }
 
     fn body_top_src(self) -> i32 {
         match self {
-            State::Sleep | State::Pet => 24,
-            State::Jump               => 14,
-            _                         => 20,
+            State::Sleep => 8,
+            _            => 1,
         }
     }
 
     fn next(self, time: u32) -> State {
         match self {
-            State::Walk  => State::Idle,
-            State::Idle  => if (time / 1_000) % 3 == 0 { State::Sleep } else { State::Walk },
-            State::Sleep => State::Idle,
-            State::Alert | State::Jump | State::Pet => State::Idle,
+            State::Walk   => State::Idle,
+            State::Idle   => State::Sleep,
+            State::Sleep  => State::Idle,
+            State::Alert | State::Jump | State::Pet | State::Typing | State::Drag | State::Stretch => State::Idle,
         }
     }
 }
@@ -126,6 +156,17 @@ fn play(handle: &OutputStreamHandle, path: &str, volume: f32) {
 struct Frames {
     right: Vec<Vec<u8>>,
     left: Vec<Vec<u8>>,
+}
+
+fn count_frames_in_row(sheet: &image::ImageBuffer<image::Rgba<u8>, Vec<u8>>, row: u32) -> u32 {
+    let max_cols = sheet.width() / FRAME_W;
+    (0..max_cols)
+        .take_while(|&col| {
+            (0..FRAME_W).any(|x| (0..FRAME_H).any(|y| {
+                sheet.get_pixel(col * FRAME_W + x, row * FRAME_H + y)[3] > 0
+            }))
+        })
+        .count() as u32
 }
 
 fn load_anim(
@@ -194,47 +235,81 @@ fn shift_pupils(
     cursor_x: f64,
     cursor_y: f64,
     facing_right: bool,
-    state: State,
+    _state: State,
     scale: u32,
     disp_w: u32,
 ) {
     let s = scale as i32;
+    let ps = 2 * s;
+
     let face_cx = pos_x as f64 + disp_w as f64 * 0.5;
-    let face_cy = pos_y as f64 + 22.0 * scale as f64;
+    let face_cy = pos_y as f64 + 9.0 * scale as f64;
     let ddx = cursor_x - face_cx;
     let ddy = cursor_y - face_cy;
     let dist = (ddx * ddx + ddy * ddy).sqrt();
-    let (sx, sy) = if dist < 5.0 {
+    let (mut sx, sy) = if dist < 8.0 {
         (0, 0)
     } else {
-        (ddx.signum() as i32 * s, (ddy / dist).round() as i32 * s)
+        (ddx.signum() as i32 * s, ((ddy / dist) * s as f64).round() as i32)
+    };
+    if !facing_right { sx = -sx; }
+
+    const EYE_BG: [u8; 4] = [102, 160, 217, 255];
+    const PUPIL:  [u8; 4] = [0,   0,   0,   255];
+
+    let py = 9 * s;
+    let (lx, rx) = if facing_right {
+        (12 * s, 18 * s)
+    } else {
+        (disp_w as i32 - 14 * s, disp_w as i32 - 20 * s)
     };
 
-    const PUPIL: [u8; 4] = [46, 47, 47, 255];
-    const GRAY:  [u8; 4] = [181, 181, 181, 255];
-    const WHITE: [u8; 4] = [224, 224, 224, 255];
+    for &base_x in &[lx, rx] {
+        paint_block(canvas, cw, pos_x + base_x,      pos_y + py,      ps, EYE_BG);
+        paint_block(canvas, cw, pos_x + base_x + sx, pos_y + py + sy, ps, PUPIL);
+    }
+}
 
-    match state {
-        State::Idle => {
-            let (el, er) = (16 * s, 19 * s);
-            let eyes: &[i32] = if facing_right {
-                &[el, er]
-            } else {
-                &[disp_w as i32 - er - s, disp_w as i32 - el - s]
-            };
-            let ey = 23 * s;
-            for &ex in eyes {
-                paint_block(canvas, cw, pos_x + ex, pos_y + ey, s, GRAY);
-                paint_block(canvas, cw, pos_x + ex + sx, pos_y + ey + sy, s, PUPIL);
+fn tint_cat(canvas: &mut [u8], cw: usize, pos_x: i32, pos_y: i32, disp_w: u32, disp_h: u32, heat: f32) {
+    if heat < 0.05 { return; }
+    let x1 = pos_x.max(0) as usize;
+    let x2 = (pos_x + disp_w as i32).min(cw as i32).max(0) as usize;
+    let y1 = pos_y.max(0) as usize;
+    let y2 = (pos_y + disp_h as i32).max(0) as usize;
+    for y in y1..y2 {
+        for x in x1..x2 {
+            let i = (y * cw + x) * 4;
+            if i + 4 > canvas.len() { continue; }
+            if canvas[i + 3] == 0 { continue; }
+            let b = canvas[i]   as i32;
+            let g = canvas[i+1] as i32;
+            let r = canvas[i+2] as i32;
+            let is_body = r > 140 && g > 50 && g < 170 && b < 80;
+            if !is_body { continue; }
+            canvas[i]   = (b as f32 * (1.0 - heat) + 20.0  * heat) as u8;
+            canvas[i+1] = (g as f32 * (1.0 - heat) + 20.0  * heat) as u8;
+            canvas[i+2] = (r as f32 * (1.0 - heat) + 210.0 * heat) as u8;
+        }
+    }
+}
+
+fn blit_scaled(canvas: &mut [u8], cw: usize, ch: usize,
+               src: &[u8], sw: usize, sh: usize,
+               dst_x: i32, dst_y: i32, dw: usize, dh: usize) {
+    for dy in 0..dh {
+        let cy = dst_y + dy as i32;
+        if cy < 0 || cy >= ch as i32 { continue; }
+        for dx in 0..dw {
+            let cx = dst_x + dx as i32;
+            if cx < 0 || cx >= cw as i32 { continue; }
+            let sx = (dx * sw / dw).min(sw - 1);
+            let sy = (dy * sh / dh).min(sh - 1);
+            let si = (sy * sw + sx) * 4;
+            let di = (cy as usize * cw + cx as usize) * 4;
+            if si + 4 <= src.len() && di + 4 <= canvas.len() {
+                canvas[di..di + 4].copy_from_slice(&src[si..si + 4]);
             }
         }
-        State::Alert => {
-            let ex = if facing_right { 19 * s } else { disp_w as i32 - 19 * s - s };
-            let ey = 25 * s;
-            paint_block(canvas, cw, pos_x + ex, pos_y + ey, s, WHITE);
-            paint_block(canvas, cw, pos_x + ex + sx, pos_y + ey + sy, s, PUPIL);
-        }
-        _ => {}
     }
 }
 
@@ -286,11 +361,9 @@ struct PetApp {
     disp_h: u32,
     body_l: i32,
     body_r: i32,
-    walk_px: i32,
     anim_ms: u32,
     volume: f32,
-    chase_start: f64,
-    chase_stop: f64,
+    corner: String,
     drag_start_pos_x: i32,
     drag_start_pos_y: i32,
     drag_start_local_x: f64,
@@ -300,6 +373,24 @@ struct PetApp {
     cursor_y: f64,
     monitor_x: i32,
     monitor_y: i32,
+    typing: Frames,
+    drag: Frames,
+    key_pressed: Arc<AtomicBool>,
+    typing_until: Option<std::time::Instant>,
+    typing_heat: f32,
+    stretch_frames: Option<Frames>,
+    stretch_small: Option<Frames>,
+    stretch_frame_count: usize,
+    stretch_every_secs: u64,
+    stretch_anim_ms: u32,
+    stretch_hold_ms: u32,
+    last_stretch: std::time::Instant,
+    stretch_transition: f32,
+    stretch_out_t: f32,
+    stretch_zooming_out: bool,
+    stretch_start_x: i32,
+    stretch_start_y: i32,
+    stretch_hold_start: Option<u32>,
 }
 
 impl PetApp {
@@ -310,37 +401,14 @@ impl PetApp {
             return;
         }
 
-        let frames = match self.state {
-            State::Walk  => &self.walk,
-            State::Idle  => &self.idle,
-            State::Sleep => &self.sleep,
-            State::Alert => &self.alert,
-            State::Jump  => &self.jump,
-            State::Pet   => &self.pet,
-        };
-        let frame_data: &[u8] = if self.vel_x >= 0 {
-            &frames.right[self.frame_idx]
-        } else {
-            &frames.left[self.frame_idx]
-        };
-
-        let src_x_off = (-self.pos_x).max(0) as usize;
-        let src_y_off = (-self.pos_y).max(0) as usize;
-        let dst_x = self.pos_x.max(0) as usize;
-        let dst_y = self.pos_y.max(0) as usize;
-        let copy_w = ((self.disp_w as i32 - src_x_off as i32)
-            .min(width as i32 - dst_x as i32))
-            .max(0) as usize;
-        let copy_h = ((self.disp_h as i32 - src_y_off as i32)
-            .min(height as i32 - dst_y as i32))
-            .max(0) as usize;
-
+        let draw_state = self.state;
         let cursor_x = self.cursor_x;
         let cursor_y = self.cursor_y;
-        let draw_state = self.state;
         let facing_right = self.vel_x >= 0;
         let pos_x = self.pos_x;
         let pos_y = self.pos_y;
+        let typing_heat = self.typing_heat;
+        let frame_idx = self.frame_idx;
 
         let buffer = {
             let pool = match self.pool.as_mut() {
@@ -356,21 +424,91 @@ impl PetApp {
                 )
                 .expect("create_buffer failed");
             canvas.fill(0);
-            for row in 0..copy_h {
-                if copy_w == 0 { break; }
-                let src = (row + src_y_off) * self.disp_w as usize * 4 + src_x_off * 4;
-                let dst = (dst_y + row) * width as usize * 4 + dst_x * 4;
-                canvas[dst..dst + copy_w * 4]
-                    .copy_from_slice(&frame_data[src..src + copy_w * 4]);
-            }
-            if matches!(draw_state, State::Idle | State::Alert) {
-                shift_pupils(canvas, width as usize, pos_x, pos_y, cursor_x, cursor_y, facing_right, draw_state, self.scale, self.disp_w);
+
+            if draw_state == State::Stretch {
+                let tw = width as usize / 2;
+                let th = height as usize / 2;
+                let tx = (width as usize / 4) as i32;
+                let ty = (height as usize / 4) as i32;
+                let cat_cx = self.stretch_start_x as f32 + self.disp_w as f32 * 0.5;
+                let cat_cy = self.stretch_start_y as f32 + self.disp_h as f32 * 0.5;
+                let lerp = |a: f32, b: f32, t: f32| a + (b - a) * t;
+
+                let (cur_w, cur_h, dst_x, dst_y, src_frame) =
+                    if self.stretch_zooming_out {
+                        let t = self.stretch_out_t;
+                        let w = lerp(tw as f32, self.disp_w as f32, t) as usize;
+                        let h = lerp(th as f32, self.disp_h as f32, t) as usize;
+                        let cx = lerp(tx as f32 + tw as f32 * 0.5, cat_cx, t);
+                        let cy = lerp(ty as f32 + th as f32 * 0.5, cat_cy, t);
+                        (w, h, (cx - w as f32 * 0.5) as i32, (cy - h as f32 * 0.5) as i32, frame_idx)
+                    } else if self.stretch_transition < 1.0 {
+                        let t = self.stretch_transition;
+                        let w = lerp(self.disp_w as f32, tw as f32, t) as usize;
+                        let h = lerp(self.disp_h as f32, th as f32, t) as usize;
+                        let cx = lerp(cat_cx, tx as f32 + tw as f32 * 0.5, t);
+                        let cy = lerp(cat_cy, ty as f32 + th as f32 * 0.5, t);
+                        (w, h, (cx - w as f32 * 0.5) as i32, (cy - h as f32 * 0.5) as i32, 0)
+                    } else {
+                        (tw, th, tx, ty, frame_idx)
+                    };
+
+                if let Some(ref sf) = self.stretch_frames {
+                    if let Some(frame_data) = sf.right.get(src_frame) {
+                        let sw = width as usize / 2;
+                        let sh = height as usize / 2;
+                        blit_scaled(canvas, width as usize, height as usize,
+                                    frame_data, sw, sh,
+                                    dst_x, dst_y, cur_w, cur_h);
+                    }
+                }
+            } else {
+                let frames = match draw_state {
+                    State::Walk    => &self.walk,
+                    State::Idle    => &self.idle,
+                    State::Sleep   => &self.sleep,
+                    State::Alert   => &self.alert,
+                    State::Jump    => &self.jump,
+                    State::Pet     => &self.pet,
+                    State::Typing  => &self.typing,
+                    State::Drag    => &self.drag,
+                    State::Stretch => unreachable!(),
+                };
+                let frame_data: &[u8] = if facing_right {
+                    &frames.right[frame_idx]
+                } else {
+                    &frames.left[frame_idx]
+                };
+                let src_x_off = (-pos_x).max(0) as usize;
+                let src_y_off = (-pos_y).max(0) as usize;
+                let dst_x = pos_x.max(0) as usize;
+                let dst_y = pos_y.max(0) as usize;
+                let copy_w = ((self.disp_w as i32 - src_x_off as i32)
+                    .min(width as i32 - dst_x as i32))
+                    .max(0) as usize;
+                let copy_h = ((self.disp_h as i32 - src_y_off as i32)
+                    .min(height as i32 - dst_y as i32))
+                    .max(0) as usize;
+                for row in 0..copy_h {
+                    if copy_w == 0 { break; }
+                    let src = (row + src_y_off) * self.disp_w as usize * 4 + src_x_off * 4;
+                    let dst = (dst_y + row) * width as usize * 4 + dst_x * 4;
+                    canvas[dst..dst + copy_w * 4]
+                        .copy_from_slice(&frame_data[src..src + copy_w * 4]);
+                }
+                if matches!(draw_state, State::Idle | State::Alert | State::Drag) {
+                    shift_pupils(canvas, width as usize, pos_x, pos_y, cursor_x, cursor_y, facing_right, draw_state, self.scale, self.disp_w);
+                }
+                if draw_state == State::Typing {
+                    tint_cat(canvas, width as usize, pos_x, pos_y, self.disp_w, self.disp_h, typing_heat);
+                }
             }
             buffer
         };
 
         let region = Region::new(&self.compositor_state).expect("region");
-        if self.dragging {
+        if draw_state == State::Stretch {
+        } else if self.dragging {
             region.wl_region().add(0, 0, width as i32, height as i32);
         } else {
             let body_t = self.state.body_top_src() * self.scale as i32;
@@ -429,19 +567,28 @@ impl CompositorHandler for PetApp {
             self.state_start_ms = time;
         }
 
-        if time.wrapping_sub(self.last_anim_ms) >= self.anim_ms {
-            let next = (self.frame_idx + 1) % self.state.frame_count();
-            if next == 0 && matches!(self.state, State::Jump | State::Pet) {
+        let anim_interval = if self.state == State::Stretch { self.stretch_anim_ms } else { self.anim_ms };
+        if time.wrapping_sub(self.last_anim_ms) >= anim_interval {
+            let total = if self.state == State::Stretch {
+                self.stretch_frame_count.max(1)
+            } else {
+                self.state.frame_count()
+            };
+            let next = (self.frame_idx + 1) % total;
+            let is_last = next == 0;
+            if is_last && self.state == State::Stretch && self.stretch_hold_start.is_none() && !self.stretch_zooming_out {
+                self.stretch_hold_start = Some(time);
+            } else if is_last && matches!(self.state, State::Jump | State::Pet) {
                 self.state = if self.state == State::Pet && self.hovered { State::Alert } else { State::Idle };
                 self.state_start_ms = time;
                 self.frame_idx = 0;
-            } else {
+            } else if !is_last || (self.stretch_hold_start.is_none() && !self.stretch_zooming_out) {
                 self.frame_idx = next;
             }
             self.last_anim_ms = time;
         }
 
-        if !self.dragging && !matches!(self.state, State::Alert | State::Jump | State::Pet | State::Walk) {
+        if !self.dragging && !matches!(self.state, State::Alert | State::Jump | State::Pet | State::Walk | State::Typing | State::Stretch) {
             if time.wrapping_sub(self.state_start_ms) >= self.state.duration_ms(time) {
                 self.state = self.state.next(time);
                 self.state_start_ms = time;
@@ -449,33 +596,70 @@ impl CompositorHandler for PetApp {
             }
         }
 
-        if !self.dragging && !matches!(self.state, State::Alert | State::Jump | State::Pet) {
-            let cat_cx = self.pos_x as f64 + self.disp_w as f64 / 2.0;
-            let cat_cy = self.pos_y as f64 + self.disp_h as f64 / 2.0;
-            let dx = self.cursor_x - cat_cx;
-            let dy = self.cursor_y - cat_cy;
-            let dist = (dx * dx + dy * dy).sqrt();
+        if self.stretch_every_secs > 0
+            && self.stretch_frame_count > 0
+            && !self.dragging
+            && !matches!(self.state, State::Stretch | State::Alert | State::Typing)
+            && self.last_stretch.elapsed().as_secs() >= self.stretch_every_secs
+        {
+            self.stretch_start_x = self.pos_x;
+            self.stretch_start_y = self.pos_y;
+            self.stretch_transition = 0.0;
+            self.stretch_out_t = 0.0;
+            self.stretch_zooming_out = false;
+            self.stretch_hold_start = None;
+            self.state = State::Stretch;
+            self.frame_idx = 0;
+            self.state_start_ms = time;
+            self.last_stretch = std::time::Instant::now();
+        }
 
-            if self.state == State::Walk {
-                if dist < self.chase_stop {
-                    self.state = State::Idle;
-                    self.state_start_ms = time;
-                    self.frame_idx = 0;
-                } else {
-                    self.vel_x = if dx > 0.0 { self.walk_px } else { -self.walk_px };
-                    self.pos_x += (dx / dist * self.walk_px as f64).round() as i32;
-                    self.pos_y += (dy / dist * self.walk_px as f64).round() as i32;
-                    let max_x = (self.width as i32 - self.disp_w as i32 + self.body_r).max(0);
-                    let max_y = (self.height as i32 - self.disp_h as i32).max(0);
-                    self.pos_x = self.pos_x.clamp(-self.body_l, max_x);
-                    self.pos_y = self.pos_y.clamp(-self.state.body_top_src() * self.scale as i32, max_y);
-                }
-            } else if dist > self.chase_start {
-                self.state = State::Walk;
+        if self.state == State::Stretch && self.stretch_transition < 1.0 {
+            let elapsed = time.wrapping_sub(self.state_start_ms);
+            self.stretch_transition = (elapsed as f32 / 500.0).min(1.0);
+        }
+
+        if let Some(hold_start) = self.stretch_hold_start {
+            if time.wrapping_sub(hold_start) >= self.stretch_hold_ms {
+                self.stretch_hold_start = None;
+                self.stretch_zooming_out = true;
+                self.stretch_out_t = 0.0;
+                self.state_start_ms = time;
+            }
+        }
+
+        if self.stretch_zooming_out {
+            let elapsed = time.wrapping_sub(self.state_start_ms);
+            self.stretch_out_t = (elapsed as f32 / 500.0).min(1.0);
+            if self.stretch_out_t >= 1.0 {
+                self.stretch_zooming_out = false;
+                self.stretch_out_t = 0.0;
+                self.state = State::Idle;
                 self.state_start_ms = time;
                 self.frame_idx = 0;
             }
         }
+
+        if self.key_pressed.load(Ordering::Relaxed) {
+            self.key_pressed.store(false, Ordering::Relaxed);
+            self.typing_until = Some(std::time::Instant::now() + std::time::Duration::from_millis(300));
+            self.typing_heat = (self.typing_heat + 0.35).min(1.0);
+            if !self.dragging && !matches!(self.state, State::Alert | State::Jump | State::Pet | State::Typing | State::Stretch) {
+                self.state = State::Typing;
+                self.state_start_ms = time;
+                self.frame_idx = 0;
+            }
+        }
+        self.typing_heat = (self.typing_heat - 0.012).max(0.0);
+
+        if self.state == State::Typing {
+            if self.typing_until.map_or(true, |u| std::time::Instant::now() >= u) {
+                self.state = State::Idle;
+                self.state_start_ms = time;
+                self.frame_idx = 0;
+            }
+        }
+
 
         self.draw(qh);
     }
@@ -566,19 +750,14 @@ impl PointerHandler for PetApp {
                     }
                 }
                 PointerEventKind::Press { button, .. } if button == BTN_LEFT => {
-                    if matches!(self.state, State::Alert | State::Pet) {
-                        self.state = State::Pet;
-                        self.state_start_ms = self.last_anim_ms;
-                        self.frame_idx = 0;
-                        if let Some(h) = &self.audio { play(h, "assets/sounds/purr.wav", self.volume); }
-                    } else {
-                        self.dragging = true;
-                        self.vel_y = 0;
-                        self.drag_start_pos_x = self.pos_x;
-                        self.drag_start_pos_y = self.pos_y;
-                        self.drag_start_local_x = event.position.0;
-                        self.drag_start_local_y = event.position.1;
-                    }
+                    self.dragging = true;
+                    self.state = State::Drag;
+                    self.frame_idx = 0;
+                    self.vel_y = 0;
+                    self.drag_start_pos_x = self.pos_x;
+                    self.drag_start_pos_y = self.pos_y;
+                    self.drag_start_local_x = event.position.0;
+                    self.drag_start_local_y = event.position.1;
                 }
                 PointerEventKind::Motion { .. } => {
                     self.cursor_x = event.position.0;
@@ -650,8 +829,34 @@ impl LayerShellHandler for PetApp {
             self.height = configure.new_size.1;
         }
 
-        if !self.pos_y_initialized && self.height > self.disp_h {
-            self.pos_y = self.height as i32 - self.disp_h as i32 - CAT_BOTTOM_MARGIN;
+        if self.stretch_frames.is_none() && self.width > 0 && self.height > 0 && self.stretch_every_secs > 0 {
+            if let Ok(img) = image::open("assets/own.png") {
+                let sheet = img.into_rgba8();
+                let count = count_frames_in_row(&sheet, 2);
+                if count > 0 {
+                    self.stretch_frame_count = count as usize;
+                    self.stretch_frames = Some(load_anim(&sheet, 2, count, self.width / 2, self.height / 2));
+                    self.stretch_small  = Some(load_anim(&sheet, 2, count, self.disp_w, self.disp_h));
+                }
+            }
+            if self.stretch_frames.is_none() {
+                self.stretch_frames = Some(Frames { right: vec![], left: vec![] });
+                self.stretch_small  = Some(Frames { right: vec![], left: vec![] });
+            }
+        }
+
+        if !self.pos_y_initialized && self.width > 0 && self.height > self.disp_h {
+            let m = CAT_BOTTOM_MARGIN;
+            self.pos_x = if self.corner.contains("right") {
+                (self.width as i32 - self.disp_w as i32 - m).max(0)
+            } else {
+                m
+            };
+            self.pos_y = if self.corner.contains("top") {
+                m
+            } else {
+                (self.height as i32 - self.disp_h as i32 - m).max(0)
+            };
             self.pos_y_initialized = true;
         }
 
@@ -682,22 +887,26 @@ delegate_seat!(PetApp);
 delegate_pointer!(PetApp);
 
 fn main() {
-    let sheet = image::open("assets/sheet.png")
-        .expect("Failed to open assets/sheet.png")
-        .into_rgba8();
-
     let cfg = load_config();
     let disp_w = FRAME_W * cfg.scale;
     let disp_h = FRAME_H * cfg.scale;
     let body_l = BODY_L_SRC * cfg.scale as i32;
     let body_r = BODY_R_SRC * cfg.scale as i32;
 
-    let walk  = load_anim(&sheet, 4, 8, disp_w, disp_h);
-    let idle  = load_anim(&sheet, 0, 4, disp_w, disp_h);
-    let sleep = load_anim(&sheet, 6, 4, disp_w, disp_h);
-    let alert = load_anim(&sheet, 7, 4, disp_w, disp_h);
-    let jump  = load_anim(&sheet, 8, 4, disp_w, disp_h);
-    let pet   = load_anim(&sheet, 3, 4, disp_w, disp_h);
+    let own_sheet = image::open("assets/own.png")
+        .expect("assets/own.png not found")
+        .into_rgba8();
+    let idle   = load_anim(&own_sheet, 0, 4, disp_w, disp_h);
+    let typing = load_anim(&own_sheet, 1, 4, disp_w, disp_h);
+    let drag   = load_anim(&own_sheet, 0, 4, disp_w, disp_h);
+    let walk   = load_anim(&own_sheet, 0, 4, disp_w, disp_h);
+    let sleep  = load_anim(&own_sheet, 0, 4, disp_w, disp_h);
+    let alert  = load_anim(&own_sheet, 0, 4, disp_w, disp_h);
+    let jump   = load_anim(&own_sheet, 0, 4, disp_w, disp_h);
+    let pet    = load_anim(&own_sheet, 0, 4, disp_w, disp_h);
+
+    let key_pressed = Arc::new(AtomicBool::new(false));
+    start_keyboard_watcher(key_pressed.clone());
 
     let audio = if cfg.sound {
         rodio::OutputStream::try_default().ok().map(|(_s, h)| { std::mem::forget(_s); h })
@@ -735,7 +944,7 @@ fn main() {
         last_anim_ms: 0,
         pos_x: 0,
         pos_y: 0,
-        vel_x: cfg.speed,
+        vel_x: 1,
         pos_y_initialized: false,
         seat_state: SeatState::new(&globals, &qh),
         pointer: None,
@@ -747,11 +956,9 @@ fn main() {
         disp_h,
         body_l,
         body_r,
-        walk_px: cfg.speed,
         anim_ms: cfg.anim_ms,
         volume: cfg.volume,
-        chase_start: cfg.chase_start,
-        chase_stop: cfg.chase_stop,
+        corner: cfg.corner,
         drag_start_pos_x: 0,
         drag_start_pos_y: 0,
         drag_start_local_x: 0.0,
@@ -761,6 +968,24 @@ fn main() {
         cursor_y: 0.0,
         monitor_x: 0,
         monitor_y: 0,
+        typing,
+        drag,
+        key_pressed,
+        typing_until: None,
+        typing_heat: 0.0,
+        stretch_frames: None,
+        stretch_small: None,
+        stretch_frame_count: 0,
+        stretch_every_secs: cfg.stretch_every_secs,
+        stretch_anim_ms: cfg.stretch_anim_ms,
+        stretch_hold_ms: cfg.stretch_hold_ms,
+        last_stretch: std::time::Instant::now(),
+        stretch_transition: 1.0,
+        stretch_out_t: 0.0,
+        stretch_zooming_out: false,
+        stretch_start_x: 0,
+        stretch_start_y: 0,
+        stretch_hold_start: None,
     };
 
     let surface = app.compositor_state.create_surface(&qh);
