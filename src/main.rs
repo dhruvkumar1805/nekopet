@@ -232,7 +232,7 @@ fn tint_cat(canvas: &mut [u8], cw: usize, pos_x: i32, pos_y: i32, disp_w: u32, d
             let b = canvas[i]   as i32;
             let g = canvas[i+1] as i32;
             let r = canvas[i+2] as i32;
-            let is_body = r > 140 && g > 50 && g < 170 && b < 80;
+            let is_body = r > 140 && g > 50 && g < 180 && b < r / 2;
             if !is_body { continue; }
             canvas[i]   = (b as f32 * (1.0 - heat) + 20.0  * heat) as u8;
             canvas[i+1] = (g as f32 * (1.0 - heat) + 20.0  * heat) as u8;
@@ -413,7 +413,7 @@ impl PetApp {
                 if matches!(draw_state, State::Idle | State::Drag) {
                     shift_pupils(canvas, width as usize, pos_x, pos_y, cursor_x, cursor_y, self.scale, self.disp_w);
                 }
-                if draw_state == State::Typing {
+                if typing_heat > 0.0 {
                     tint_cat(canvas, width as usize, pos_x, pos_y, self.disp_w, self.disp_h, typing_heat);
                 }
             }
@@ -553,14 +553,14 @@ impl CompositorHandler for PetApp {
         if self.key_pressed.load(Ordering::Relaxed) {
             self.key_pressed.store(false, Ordering::Relaxed);
             self.typing_until = Some(std::time::Instant::now() + std::time::Duration::from_millis(300));
-            self.typing_heat = (self.typing_heat + 0.35).min(1.0);
+            self.typing_heat = (self.typing_heat + 0.08).min(1.0);
             if !self.dragging && !matches!(self.state, State::Typing | State::Stretch) {
                 self.state = State::Typing;
                 self.state_start_ms = time;
                 self.frame_idx = 0;
             }
         }
-        self.typing_heat = (self.typing_heat - 0.012).max(0.0);
+        self.typing_heat = (self.typing_heat - 0.006).max(0.0);
 
         if self.state == State::Typing {
             if self.typing_until.map_or(true, |u| std::time::Instant::now() >= u) {
