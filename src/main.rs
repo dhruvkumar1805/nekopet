@@ -275,6 +275,7 @@ struct PetApp {
     idle: Frames,
     typing: Frames,
     drag: Frames,
+    drag_frame_count: usize,
     state: State,
     state_start_ms: u32,
     frame_idx: usize,
@@ -482,9 +483,11 @@ impl CompositorHandler for PetApp {
         }
 
         let anim_interval = if self.state == State::Stretch { self.stretch_anim_ms } else { self.anim_ms };
-        if time.wrapping_sub(self.last_anim_ms) >= anim_interval {
+        if self.state != State::Drag && time.wrapping_sub(self.last_anim_ms) >= anim_interval {
             let total = if self.state == State::Stretch {
                 self.stretch_frame_count.max(1)
+            } else if self.state == State::Drag {
+                self.drag_frame_count.max(1)
             } else {
                 self.state.frame_count()
             };
@@ -645,7 +648,7 @@ impl PointerHandler for PetApp {
                 PointerEventKind::Press { button, .. } if button == BTN_LEFT => {
                     self.dragging = true;
                     self.state = State::Drag;
-                    self.frame_idx = 0;
+                    self.frame_idx = 1;
                     self.drag_start_pos_x = self.pos_x;
                     self.drag_start_pos_y = self.pos_y;
                     self.drag_start_local_x = event.position.0;
@@ -787,7 +790,8 @@ fn main() {
         .into_rgba8();
     let idle   = load_anim(&own_sheet, 0, 4, disp_w, disp_h);
     let typing = load_anim(&own_sheet, 1, 4, disp_w, disp_h);
-    let drag   = load_anim(&own_sheet, 0, 4, disp_w, disp_h);
+    let drag_count = count_frames_in_row(&own_sheet, 3).max(1) as usize;
+    let drag   = load_anim(&own_sheet, 3, drag_count as u32, disp_w, disp_h);
 
     let key_pressed = Arc::new(AtomicBool::new(false));
     start_keyboard_watcher(key_pressed.clone());
@@ -813,6 +817,7 @@ fn main() {
         idle,
         typing,
         drag,
+        drag_frame_count: drag_count,
         state: State::Idle,
         state_start_ms: 0,
         frame_idx: 0,
