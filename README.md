@@ -1,6 +1,8 @@
-# pet-linux
+# Nekopet
 
 A desktop pet cat for Hyprland (and other wlr-based Wayland compositors). Sits as a transparent overlay on your screen, reacts to your keyboard, and can be dragged anywhere.
+
+<img src="assets/demo.gif" width="300" />
 
 ## Features
 
@@ -17,8 +19,8 @@ A desktop pet cat for Hyprland (and other wlr-based Wayland compositors). Sits a
 ## Build & Run
 
 ```bash
-git clone https://github.com/dhruvkumar1805/pet-linux
-cd pet-linux
+git clone https://github.com/dhruvkumar1805/nekopet
+cd nekopet
 cargo run --release
 ```
 
@@ -26,7 +28,7 @@ The binary expects to be run from the project root so it can find `assets/own.pn
 
 ## Configuration
 
-On first run, a config file is created at `~/.config/pet-linux/config.toml`:
+On first run, a config file is created at `~/.config/nekopet/config.toml`:
 
 ```toml
 scale               = 3       # sprite size multiplier (3 = 96×96px from 32×32 source)
@@ -41,12 +43,12 @@ stretch_hold_ms     = 1500    # how long the last stretch frame holds before zoo
 
 All animations come from a single sprite sheet at `assets/own.png`. Each row is 32×32 pixels per frame, left to right.
 
-| Row | Animation | Frames                                 |
-| --- | --------- | -------------------------------------- |
-| 0   | Idle      | 4                                      |
-| 1   | Typing    | 4                                      |
-| 2   | Stretch   | auto-detected (any non-empty frames)   |
-| 3   | Drag      | auto-detected (any non-empty frames)   |
+| Row | Animation | Frames                               |
+| --- | --------- | ------------------------------------ |
+| 0   | Idle      | 4                                    |
+| 1   | Typing    | 4                                    |
+| 2   | Stretch   | auto-detected (any non-empty frames) |
+| 3   | Drag      | auto-detected (any non-empty frames) |
 
 The sheet is scaled up using nearest-neighbor interpolation, so pixel art looks sharp at any scale.
 
@@ -67,5 +69,5 @@ let rx = 18 * s;  // right pupil x in source pixels
 Add to your Hyprland config:
 
 ```
-exec-once = /path/to/pet-linux/target/release/pet-linux
+exec-once = /path/to/nekopet/target/release/nekopet
 ```

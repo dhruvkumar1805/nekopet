@@ -48,7 +48,7 @@ fn load_config() -> Config {
     let config_home = std::env::var("XDG_CONFIG_HOME").unwrap_or_else(|_| {
         format!("{}/.config", std::env::var("HOME").unwrap_or_else(|_| ".".into()))
     });
-    let path = std::path::PathBuf::from(&config_home).join("pet-linux/config.toml");
+    let path = std::path::PathBuf::from(&config_home).join("nekopet/config.toml");
     if !path.exists() {
         let _ = std::fs::create_dir_all(path.parent().unwrap());
         let _ = std::fs::write(&path,
@@ -865,7 +865,7 @@ fn main() {
         &qh,
         surface,
         Layer::Top,
-        Some("pet-cat"),
+        Some("nekopet"),
         None,
     );
     layer_surface.set_size(0, 0);
