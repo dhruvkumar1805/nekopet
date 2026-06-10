@@ -2,8 +2,6 @@
 
 A desktop pet cat for Hyprland (and other wlr-based Wayland compositors). Sits as a transparent overlay on your screen, reacts to your keyboard, and can be dragged anywhere.
 
-![pet-linux demo](assets/demo.gif)
-
 ## Features
 
 - **Idle** — cat sits in the corner with eyes that follow your cursor
@@ -48,7 +46,7 @@ All animations come from a single sprite sheet at `assets/own.png`. Each row is 
 | 0   | Idle      | 4                                      |
 | 1   | Typing    | 4                                      |
 | 2   | Stretch   | auto-detected (any non-empty frames)   |
-| 3   | Drag      | 4 (currently uses idle as placeholder) |
+| 3   | Drag      | auto-detected (any non-empty frames)   |
 
 The sheet is scaled up using nearest-neighbor interpolation, so pixel art looks sharp at any scale.
 
