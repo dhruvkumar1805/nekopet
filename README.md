@@ -37,6 +37,8 @@ corner              = "bottom-right"  # starting corner: bottom-right, bottom-le
 stretch_every_secs  = 1800    # how often the stretch animation fires (seconds); 0 to disable
 stretch_anim_ms     = 400     # frame speed for the stretch animation
 stretch_hold_ms     = 1500    # how long the last stretch frame holds before zooming out
+bounce_every_secs   = 60      # how often the bounce animation fires (seconds); 0 to disable
+lean_every_secs     = 45      # how often the lean animation fires (seconds); 0 to disable
 ```
 
 ## Custom Sprites
@@ -49,6 +51,8 @@ All animations come from a single sprite sheet at `assets/own.png`. Each row is 
 | 1   | Typing    | 4                                    |
 | 2   | Stretch   | auto-detected (any non-empty frames) |
 | 3   | Drag      | auto-detected (any non-empty frames) |
+| 4   | Bounce    | auto-detected (any non-empty frames) |
+| 5   | Lean      | auto-detected (any non-empty frames) |
 
 The sheet is scaled up using nearest-neighbor interpolation, so pixel art looks sharp at any scale.
 
@@ -56,7 +60,7 @@ To replace the cat with your own character, edit `assets/own.png` keeping the sa
 
 ## Eye Tracking
 
-During idle and drag states, the cat's pupils shift toward the cursor. The pupil positions are hardcoded for the default sprite at source pixels (12, 9) and (18, 9). If you draw a different character with eyes in different positions, update these constants in `src/main.rs`:
+During idle and drag states, the cat's pupils shift toward the cursor while it's hovering over the cat — Wayland doesn't let clients query the cursor position outside their own surface, so tracking only works within the cat's bounds. The pupil positions are hardcoded for the default sprite at source pixels (12, 9) and (18, 9). If you draw a different character with eyes in different positions, update these constants in `src/main.rs`:
 
 ```rust
 let lx = 12 * s;  // left pupil x in source pixels

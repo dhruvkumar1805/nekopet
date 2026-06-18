@@ -36,11 +36,13 @@ struct Config {
     stretch_every_secs: u64,
     stretch_anim_ms: u32,
     stretch_hold_ms: u32,
+    bounce_every_secs: u64,
+    lean_every_secs: u64,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Self { scale: 3, anim_ms: 120, corner: "bottom-right".into(), stretch_every_secs: 1800, stretch_anim_ms: 400, stretch_hold_ms: 1500 }
+        Self { scale: 3, anim_ms: 120, corner: "bottom-right".into(), stretch_every_secs: 1800, stretch_anim_ms: 400, stretch_hold_ms: 1500, bounce_every_secs: 60, lean_every_secs: 45 }
     }
 }
 
@@ -52,7 +54,7 @@ fn load_config() -> Config {
     if !path.exists() {
         let _ = std::fs::create_dir_all(path.parent().unwrap());
         let _ = std::fs::write(&path,
-            "scale   = 3\nanim_ms = 120\ncorner  = \"bottom-right\"\nstretch_every_secs = 1800\nstretch_anim_ms = 400\nstretch_hold_ms = 1500\n");
+            "scale   = 3\nanim_ms = 120\ncorner  = \"bottom-right\"\nstretch_every_secs = 1800\nstretch_anim_ms = 400\nstretch_hold_ms = 1500\nbounce_every_secs = 60\nlean_every_secs = 45\n");
     }
     std::fs::read_to_string(&path).ok()
         .and_then(|s| toml::from_str(&s).ok())
@@ -64,6 +66,8 @@ const FRAME_H: u32 = 32;
 const BODY_L_SRC: i32 = 3;
 const BODY_R_SRC: i32 = 10;
 const CAT_BOTTOM_MARGIN: i32 = 16;
+const BREATHE_PERIOD_MS: f64 = 4000.0;
+const BREATHE_AMPLITUDE: f32 = 0.04;
 
 fn start_keyboard_watcher(flag: Arc<AtomicBool>) {
     for i in 0..32 {
@@ -94,6 +98,8 @@ enum State {
     Typing,
     Drag,
     Stretch,
+    Bounce,
+    Lean,
 }
 
 impl State {
@@ -104,7 +110,7 @@ impl State {
     fn duration_ms(self, time: u32) -> u32 {
         match self {
             State::Idle    => 3_000 + (time % 4_000),
-            State::Typing | State::Drag | State::Stretch => u32::MAX,
+            State::Typing | State::Drag | State::Stretch | State::Bounce | State::Lean => u32::MAX,
         }
     }
 }
@@ -150,20 +156,6 @@ fn load_anim(
         })
         .collect();
     Frames { right }
-}
-
-fn hyprland_cursor_pos() -> Option<(f64, f64)> {
-    use std::io::{Read, Write};
-    use std::os::unix::net::UnixStream;
-    let sig = std::env::var("HYPRLAND_INSTANCE_SIGNATURE").ok()?;
-    let xdg = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
-    let path = format!("{}/hypr/{}/.socket.sock", xdg, sig);
-    let mut s = UnixStream::connect(&path).ok()?;
-    s.write_all(b"cursorpos").ok()?;
-    let mut buf = String::new();
-    s.read_to_string(&mut buf).ok()?;
-    let (xs, ys) = buf.trim().split_once(',')?;
-    Some((xs.trim().parse().ok()?, ys.trim().parse().ok()?))
 }
 
 fn paint_block(canvas: &mut [u8], cw: usize, x: i32, y: i32, size: i32, color: [u8; 4]) {
@@ -280,6 +272,7 @@ struct PetApp {
     state_start_ms: u32,
     frame_idx: usize,
     last_anim_ms: u32,
+    frame_time_ms: u32,
     pos_x: i32,
     pos_y: i32,
     pos_y_initialized: bool,
@@ -299,8 +292,6 @@ struct PetApp {
     drag_start_local_y: f64,
     cursor_x: f64,
     cursor_y: f64,
-    monitor_x: i32,
-    monitor_y: i32,
     key_pressed: Arc<AtomicBool>,
     typing_until: Option<std::time::Instant>,
     typing_heat: f32,
@@ -316,6 +307,14 @@ struct PetApp {
     stretch_start_x: i32,
     stretch_start_y: i32,
     stretch_hold_start: Option<u32>,
+    bounce: Frames,
+    bounce_frame_count: usize,
+    bounce_every_secs: u64,
+    last_bounce: std::time::Instant,
+    lean: Frames,
+    lean_frame_count: usize,
+    lean_every_secs: u64,
+    last_lean: std::time::Instant,
 }
 
 impl PetApp {
@@ -391,31 +390,49 @@ impl PetApp {
                     State::Idle    => &self.idle,
                     State::Typing  => &self.typing,
                     State::Drag    => &self.drag,
+                    State::Bounce  => &self.bounce,
+                    State::Lean    => &self.lean,
                     State::Stretch => unreachable!(),
                 };
                 let frame_data: &[u8] = &frames.right[frame_idx];
-                let src_x_off = (-pos_x).max(0) as usize;
-                let src_y_off = (-pos_y).max(0) as usize;
-                let dst_x = pos_x.max(0) as usize;
-                let dst_y = pos_y.max(0) as usize;
-                let copy_w = ((self.disp_w as i32 - src_x_off as i32)
-                    .min(width as i32 - dst_x as i32))
-                    .max(0) as usize;
-                let copy_h = ((self.disp_h as i32 - src_y_off as i32)
-                    .min(height as i32 - dst_y as i32))
-                    .max(0) as usize;
-                for row in 0..copy_h {
-                    if copy_w == 0 { break; }
-                    let src = (row + src_y_off) * self.disp_w as usize * 4 + src_x_off * 4;
-                    let dst = (dst_y + row) * width as usize * 4 + dst_x * 4;
-                    canvas[dst..dst + copy_w * 4]
-                        .copy_from_slice(&frame_data[src..src + copy_w * 4]);
+
+                let (body_y, body_h) = if draw_state == State::Idle {
+                    let phase = (self.frame_time_ms as f64 / BREATHE_PERIOD_MS) * std::f64::consts::TAU;
+                    let breathe_scale = 1.0 + BREATHE_AMPLITUDE * phase.sin() as f32;
+                    let h = ((self.disp_h as f32 * breathe_scale).round() as i32).max(1);
+                    (pos_y + self.disp_h as i32 - h, h)
+                } else {
+                    (pos_y, self.disp_h as i32)
+                };
+
+                if body_h == self.disp_h as i32 {
+                    let src_x_off = (-pos_x).max(0) as usize;
+                    let src_y_off = (-body_y).max(0) as usize;
+                    let dst_x = pos_x.max(0) as usize;
+                    let dst_y = body_y.max(0) as usize;
+                    let copy_w = ((self.disp_w as i32 - src_x_off as i32)
+                        .min(width as i32 - dst_x as i32))
+                        .max(0) as usize;
+                    let copy_h = ((self.disp_h as i32 - src_y_off as i32)
+                        .min(height as i32 - dst_y as i32))
+                        .max(0) as usize;
+                    for row in 0..copy_h {
+                        if copy_w == 0 { break; }
+                        let src = (row + src_y_off) * self.disp_w as usize * 4 + src_x_off * 4;
+                        let dst = (dst_y + row) * width as usize * 4 + dst_x * 4;
+                        canvas[dst..dst + copy_w * 4]
+                            .copy_from_slice(&frame_data[src..src + copy_w * 4]);
+                    }
+                } else {
+                    blit_scaled(canvas, width as usize, height as usize,
+                                frame_data, self.disp_w as usize, self.disp_h as usize,
+                                pos_x, body_y, self.disp_w as usize, body_h as usize);
                 }
-                if matches!(draw_state, State::Idle | State::Drag) {
-                    shift_pupils(canvas, width as usize, pos_x, pos_y, cursor_x, cursor_y, self.scale, self.disp_w);
+                if matches!(draw_state, State::Idle | State::Drag | State::Bounce | State::Lean) {
+                    shift_pupils(canvas, width as usize, pos_x, body_y, cursor_x, cursor_y, self.scale, self.disp_w);
                 }
                 if typing_heat > 0.0 {
-                    tint_cat(canvas, width as usize, pos_x, pos_y, self.disp_w, self.disp_h, typing_heat);
+                    tint_cat(canvas, width as usize, pos_x, body_y, self.disp_w, body_h as u32, typing_heat);
                 }
             }
             buffer
@@ -472,10 +489,7 @@ impl CompositorHandler for PetApp {
         _: &wl_surface::WlSurface,
         time: u32,
     ) {
-        if let Some((cx, cy)) = hyprland_cursor_pos() {
-            self.cursor_x = cx - self.monitor_x as f64;
-            self.cursor_y = cy - self.monitor_y as f64;
-        }
+        self.frame_time_ms = time;
 
         if self.last_anim_ms == 0 {
             self.last_anim_ms = time;
@@ -483,11 +497,15 @@ impl CompositorHandler for PetApp {
         }
 
         let anim_interval = if self.state == State::Stretch { self.stretch_anim_ms } else { self.anim_ms };
-        if self.state != State::Drag && time.wrapping_sub(self.last_anim_ms) >= anim_interval {
+        if !matches!(self.state, State::Drag | State::Typing) && time.wrapping_sub(self.last_anim_ms) >= anim_interval {
             let total = if self.state == State::Stretch {
                 self.stretch_frame_count.max(1)
             } else if self.state == State::Drag {
                 self.drag_frame_count.max(1)
+            } else if self.state == State::Bounce {
+                self.bounce_frame_count.max(1)
+            } else if self.state == State::Lean {
+                self.lean_frame_count.max(1)
             } else {
                 self.state.frame_count()
             };
@@ -498,10 +516,15 @@ impl CompositorHandler for PetApp {
             } else if !is_last || (self.stretch_hold_start.is_none() && !self.stretch_zooming_out) {
                 self.frame_idx = next;
             }
+            if is_last && matches!(self.state, State::Bounce | State::Lean) {
+                self.state = State::Idle;
+                self.state_start_ms = time;
+                self.frame_idx = 0;
+            }
             self.last_anim_ms = time;
         }
 
-        if !self.dragging && !matches!(self.state, State::Typing | State::Drag | State::Stretch) {
+        if !self.dragging && !matches!(self.state, State::Typing | State::Drag | State::Stretch | State::Bounce | State::Lean) {
             if time.wrapping_sub(self.state_start_ms) >= self.state.duration_ms(time) {
                 self.state = State::Idle;
                 self.state_start_ms = time;
@@ -553,6 +576,30 @@ impl CompositorHandler for PetApp {
             }
         }
 
+        if self.bounce_every_secs > 0
+            && self.bounce_frame_count > 0
+            && !self.dragging
+            && !matches!(self.state, State::Stretch | State::Typing | State::Bounce | State::Lean)
+            && self.last_bounce.elapsed().as_secs() >= self.bounce_every_secs
+        {
+            self.state = State::Bounce;
+            self.frame_idx = 0;
+            self.state_start_ms = time;
+            self.last_bounce = std::time::Instant::now();
+        }
+
+        if self.lean_every_secs > 0
+            && self.lean_frame_count > 0
+            && !self.dragging
+            && !matches!(self.state, State::Stretch | State::Typing | State::Bounce | State::Lean)
+            && self.last_lean.elapsed().as_secs() >= self.lean_every_secs
+        {
+            self.state = State::Lean;
+            self.frame_idx = 0;
+            self.state_start_ms = time;
+            self.last_lean = std::time::Instant::now();
+        }
+
         if self.key_pressed.load(Ordering::Relaxed) {
             self.key_pressed.store(false, Ordering::Relaxed);
             self.typing_until = Some(std::time::Instant::now() + std::time::Duration::from_millis(300));
@@ -561,6 +608,9 @@ impl CompositorHandler for PetApp {
                 self.state = State::Typing;
                 self.state_start_ms = time;
                 self.frame_idx = 0;
+            } else if self.state == State::Typing {
+                let total = self.state.frame_count().max(1);
+                self.frame_idx = (self.frame_idx + 1) % total;
             }
         }
         self.typing_heat = (self.typing_heat - 0.006).max(0.0);
@@ -581,14 +631,8 @@ impl CompositorHandler for PetApp {
         _: &Connection,
         _: &QueueHandle<Self>,
         _: &wl_surface::WlSurface,
-        output: &wl_output::WlOutput,
+        _: &wl_output::WlOutput,
     ) {
-        if let Some(info) = self.output_state.info(output) {
-            if let Some(pos) = info.logical_position {
-                self.monitor_x = pos.0;
-                self.monitor_y = pos.1;
-            }
-        }
     }
 
     fn surface_leave(
@@ -645,6 +689,10 @@ impl PointerHandler for PetApp {
     ) {
         for event in events {
             match event.kind {
+                PointerEventKind::Leave { .. } => {
+                    self.cursor_x = self.pos_x as f64 + self.disp_w as f64 * 0.5;
+                    self.cursor_y = self.pos_y as f64 + 9.0 * self.scale as f64;
+                }
                 PointerEventKind::Press { button, .. } if button == BTN_LEFT => {
                     self.dragging = true;
                     self.state = State::Drag;
@@ -792,6 +840,10 @@ fn main() {
     let typing = load_anim(&own_sheet, 1, 4, disp_w, disp_h);
     let drag_count = count_frames_in_row(&own_sheet, 3).max(1) as usize;
     let drag   = load_anim(&own_sheet, 3, drag_count as u32, disp_w, disp_h);
+    let bounce_count = count_frames_in_row(&own_sheet, 4).max(1) as usize;
+    let bounce = load_anim(&own_sheet, 4, bounce_count as u32, disp_w, disp_h);
+    let lean_count = count_frames_in_row(&own_sheet, 5).max(1) as usize;
+    let lean = load_anim(&own_sheet, 5, lean_count as u32, disp_w, disp_h);
 
     let key_pressed = Arc::new(AtomicBool::new(false));
     start_keyboard_watcher(key_pressed.clone());
@@ -818,10 +870,15 @@ fn main() {
         typing,
         drag,
         drag_frame_count: drag_count,
+        bounce,
+        bounce_frame_count: bounce_count,
+        lean,
+        lean_frame_count: lean_count,
         state: State::Idle,
         state_start_ms: 0,
         frame_idx: 0,
         last_anim_ms: 0,
+        frame_time_ms: 0,
         pos_x: 0,
         pos_y: 0,
         pos_y_initialized: false,
@@ -841,8 +898,6 @@ fn main() {
         drag_start_local_y: 0.0,
         cursor_x: 0.0,
         cursor_y: 0.0,
-        monitor_x: 0,
-        monitor_y: 0,
         key_pressed,
         typing_until: None,
         typing_heat: 0.0,
@@ -858,6 +913,10 @@ fn main() {
         stretch_start_x: 0,
         stretch_start_y: 0,
         stretch_hold_start: None,
+        bounce_every_secs: cfg.bounce_every_secs,
+        last_bounce: std::time::Instant::now(),
+        lean_every_secs: cfg.lean_every_secs,
+        last_lean: std::time::Instant::now(),
     };
 
     let surface = app.compositor_state.create_surface(&qh);
